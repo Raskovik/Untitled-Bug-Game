@@ -3,6 +3,7 @@ import {
   Color3,
   Engine,
   HemisphericLight,
+  Mesh,
   MeshBuilder,
   Scene,
   StandardMaterial,
@@ -21,7 +22,13 @@ const FIXED_RADIUS = 45;
 
 const SKY_COLOR = new Color3(0.53, 0.72, 0.85);
 
-export function createScene(engine: Engine, canvas: HTMLCanvasElement): Scene {
+export interface GameScene {
+  scene: Scene;
+  camera: ArcRotateCamera;
+  ground: Mesh;
+}
+
+export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScene {
   const scene = new Scene(engine);
   scene.clearColor.set(SKY_COLOR.r, SKY_COLOR.g, SKY_COLOR.b, 1);
 
@@ -52,7 +59,7 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): Scene {
     engine.resize();
   });
 
-  return scene;
+  return { scene, camera, ground };
 }
 
 function createGroundMaterial(scene: Scene) {

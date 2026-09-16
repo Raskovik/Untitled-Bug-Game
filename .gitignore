@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+packages/server/uploads/
 .env
 .env.*
 !.env.example
