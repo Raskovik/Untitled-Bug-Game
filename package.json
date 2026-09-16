@@ -1,0 +1,17 @@
+{
+  "name": "untitled-bug-game",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace packages/server",
+    "dev:client": "npm run dev --workspace packages/client",
+    "build": "npm run build --workspace packages/shared && npm run build --workspace packages/server && npm run build --workspace packages/client",
+    "typecheck": "npm run typecheck --workspace packages/shared && npm run typecheck --workspace packages/server && npm run typecheck --workspace packages/client"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
