@@ -1,4 +1,4 @@
-import type { AdminUser, WorldMapData } from "@bug-game/shared";
+import type { AdminUser, UploadedImage, WorldMapData } from "@bug-game/shared";
 
 const SERVER_URL = "http://localhost:3001";
 
@@ -44,6 +44,10 @@ export async function uploadImage(file: File): Promise<{ url: string }> {
   const formData = new FormData();
   formData.append("image", file);
   return request("/admin/upload", { method: "POST", body: formData });
+}
+
+export function listUploads(): Promise<UploadedImage[]> {
+  return request("/admin/uploads");
 }
 
 export function resolveImageUrl(url: string): string {

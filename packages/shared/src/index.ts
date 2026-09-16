@@ -33,6 +33,12 @@ export interface WorldMapData {
   barriers: Barrier[];
 }
 
+export interface UploadedImage {
+  id: string;
+  url: string;
+  originalName: string;
+}
+
 export interface AdminUser {
   email: string;
   name: string;

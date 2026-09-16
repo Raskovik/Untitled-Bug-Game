@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { Router } from "express";
 import multer from "multer";
-import type { WorldMapData } from "@bug-game/shared";
+import type { UploadedImage as UploadedImageType, WorldMapData } from "@bug-game/shared";
 import { requireAdmin } from "../middleware/requireAdmin.js";
 import { WorldMap } from "../models/WorldMap.js";
+import { UploadedImage } from "../models/UploadedImage.js";
 import { isDatabaseConnected } from "../db.js";
 
 export const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
@@ -32,12 +33,38 @@ export const adminRouter = Router();
 
 adminRouter.use(requireAdmin);
 
-adminRouter.post("/upload", upload.single("image"), (req, res) => {
+adminRouter.post("/upload", upload.single("image"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "No image uploaded" });
     return;
   }
-  res.json({ url: `/uploads/${req.file.filename}` });
+
+  const url = `/uploads/${req.file.filename}`;
+
+  if (isDatabaseConnected()) {
+    await UploadedImage.create({
+      id: randomUUID(),
+      url,
+      originalName: req.file.originalname,
+    });
+  }
+
+  res.json({ url });
+});
+
+adminRouter.get("/uploads", async (_req, res) => {
+  if (!isDatabaseConnected()) {
+    res.json([]);
+    return;
+  }
+
+  const images = await UploadedImage.find().sort({ uploadedAt: -1 }).limit(100).lean();
+  const result: UploadedImageType[] = images.map((image) => ({
+    id: image.id,
+    url: image.url,
+    originalName: image.originalName,
+  }));
+  res.json(result);
 });
 
 adminRouter.get("/map", async (_req, res) => {
