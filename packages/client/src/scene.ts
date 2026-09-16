@@ -19,9 +19,18 @@ const FIXED_ALPHA = -Math.PI / 2;
 const FIXED_BETA = Math.PI / 3.6;
 const FIXED_RADIUS = 45;
 
+const SKY_COLOR = new Color3(0.53, 0.72, 0.85);
+
 export function createScene(engine: Engine, canvas: HTMLCanvasElement): Scene {
   const scene = new Scene(engine);
-  scene.clearColor.set(0.1, 0.11, 0.13, 1);
+  scene.clearColor.set(SKY_COLOR.r, SKY_COLOR.g, SKY_COLOR.b, 1);
+
+  // Fog fades the ground into the sky color before its edges ever reach the
+  // camera's view, so the world reads as continuous terrain instead of a
+  // floating plane with visible boundaries.
+  scene.fogMode = Scene.FOGMODE_EXP2;
+  scene.fogColor = SKY_COLOR;
+  scene.fogDensity = 0.012;
 
   const camera = new ArcRotateCamera(
     "mainCamera",
@@ -36,7 +45,7 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): Scene {
   const light = new HemisphericLight("mainLight", new Vector3(0, 1, 0), scene);
   light.intensity = 0.9;
 
-  const ground = MeshBuilder.CreateGround("ground", { width: 40, height: 40 }, scene);
+  const ground = MeshBuilder.CreateGround("ground", { width: 400, height: 400 }, scene);
   ground.material = createGroundMaterial(scene);
 
   window.addEventListener("resize", () => {
