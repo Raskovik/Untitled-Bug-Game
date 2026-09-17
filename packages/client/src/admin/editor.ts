@@ -24,7 +24,7 @@ const MIN_SCALE = 0.2;
 const MAX_SCALE = 6;
 const KEY_PAN_STEP = 3;
 
-type Tool = "select" | "place" | "barrier";
+type Tool = "select" | "barrier";
 type SelectionKind = "decor" | "barrier" | null;
 type DragMode = "move" | "rotate" | "resize";
 type PanDirection = "up" | "down" | "left" | "right";
@@ -49,7 +49,6 @@ export class WorldEditor {
   private decorItems: DecorItem[] = [];
   private barriers: Barrier[] = [];
   private tool: Tool = "select";
-  private pendingImageUrl: string | null = null;
   private selectedId: string | null = null;
   private selectedKind: SelectionKind = null;
   private drawStart: { x: number; z: number } | null = null;
@@ -103,10 +102,37 @@ export class WorldEditor {
     return { decor: this.decorItems, barriers: this.barriers };
   }
 
-  setTool(tool: Tool, imageUrl?: string): void {
+  setTool(tool: Tool): void {
     this.tool = tool;
-    this.pendingImageUrl = tool === "place" ? (imageUrl ?? null) : null;
     this.clearSelection();
+  }
+
+  /**
+   * Places a decor item at the world position under the given canvas-relative
+   * screen coordinates (used by drag-and-drop from the tray or the OS), and
+   * selects it so the floating toolbar appears immediately.
+   */
+  placeDecor(screenX: number, screenY: number, imageUrl: string): void {
+    const point = this.pickGroundPointAt(screenX, screenY);
+    if (!point) return;
+
+    const item: DecorItem = {
+      id: crypto.randomUUID(),
+      imageUrl,
+      x: point.x,
+      z: point.z,
+      rotation: 0,
+      scale: 1,
+      layer: "auto",
+    };
+    this.decorItems.push(item);
+    this.addDecorMesh(item);
+    this.tool = "select";
+    this.selectedId = item.id;
+    this.selectedKind = "decor";
+    this.callbacks.onSelectionChange(item, "decor");
+    this.callbacks.onStatusChange(`Placed decor at (${point.x.toFixed(1)}, ${point.z.toFixed(1)})`);
+    this.pushHistory();
   }
 
   /** Arms a one-shot rotate gesture: the next canvas drag rotates the selected item. */
@@ -140,16 +166,29 @@ export class WorldEditor {
 
   /** Pans the camera one fixed step in the given screen-relative direction (for keyboard shortcuts). */
   panView(direction: PanDirection): void {
-    const { camera } = this.gameScene;
-    const right = camera.getDirection(Vector3.Right());
-    const up = camera.getDirection(Vector3.Up());
+    const { right, forward } = this.groundPanAxes();
     const stepVector: Record<PanDirection, Vector3> = {
-      up: up.scale(KEY_PAN_STEP),
-      down: up.scale(-KEY_PAN_STEP),
+      up: forward.scale(KEY_PAN_STEP),
+      down: forward.scale(-KEY_PAN_STEP),
       left: right.scale(-KEY_PAN_STEP),
       right: right.scale(KEY_PAN_STEP),
     };
-    camera.target.addInPlace(stepVector[direction]);
+    this.gameScene.camera.target.addInPlace(stepVector[direction]);
+  }
+
+  /**
+   * The camera's right/"up on screen" directions, flattened onto the ground
+   * plane (Y zeroed out) so panning always slides across the flat map —
+   * like sliding a sheet of paper — instead of drifting off the fixed
+   * viewing angle the way the raw camera-space vectors would.
+   */
+  private groundPanAxes(): { right: Vector3; forward: Vector3 } {
+    const { camera } = this.gameScene;
+    const rawRight = camera.getDirection(Vector3.Right());
+    const rawUp = camera.getDirection(Vector3.Up());
+    const right = new Vector3(rawRight.x, 0, rawRight.z).normalize();
+    const forward = new Vector3(rawUp.x, 0, rawUp.z).normalize();
+    return { right, forward };
   }
 
   updateSelected(patch: Partial<DecorItem> | Partial<Barrier>): void {
@@ -326,11 +365,11 @@ export class WorldEditor {
   }
 
   private pickGroundPoint(): { x: number; z: number } | null {
-    const pick = this.gameScene.scene.pick(
-      this.gameScene.scene.pointerX,
-      this.gameScene.scene.pointerY,
-      (mesh) => mesh === this.gameScene.ground
-    );
+    return this.pickGroundPointAt(this.gameScene.scene.pointerX, this.gameScene.scene.pointerY);
+  }
+
+  private pickGroundPointAt(screenX: number, screenY: number): { x: number; z: number } | null {
+    const pick = this.gameScene.scene.pick(screenX, screenY, (mesh) => mesh === this.gameScene.ground);
     if (!pick?.hit || !pick.pickedPoint) return null;
     return { x: pick.pickedPoint.x, z: pick.pickedPoint.z };
   }
@@ -383,25 +422,6 @@ export class WorldEditor {
       }
 
       this.pendingInteraction = null;
-      return;
-    }
-
-    if (this.tool === "place" && this.pendingImageUrl) {
-      const point = this.pickGroundPoint();
-      if (!point) return;
-      const item: DecorItem = {
-        id: crypto.randomUUID(),
-        imageUrl: this.pendingImageUrl,
-        x: point.x,
-        z: point.z,
-        rotation: 0,
-        scale: 1,
-        layer: "auto",
-      };
-      this.decorItems.push(item);
-      this.addDecorMesh(item);
-      this.callbacks.onStatusChange(`Placed decor at (${point.x.toFixed(1)}, ${point.z.toFixed(1)})`);
-      this.pushHistory();
       return;
     }
 
@@ -578,11 +598,10 @@ export class WorldEditor {
     const { camera } = this.gameScene;
     const unitsPerPixelX = ((camera.orthoRight ?? 1) - (camera.orthoLeft ?? -1)) / this.engine.getRenderWidth();
     const unitsPerPixelY = ((camera.orthoTop ?? 1) - (camera.orthoBottom ?? -1)) / this.engine.getRenderHeight();
-    const right = camera.getDirection(Vector3.Right());
-    const up = camera.getDirection(Vector3.Up());
+    const { right, forward } = this.groundPanAxes();
     const worldDelta = right
       .scale(-dxScreen * unitsPerPixelX)
-      .add(up.scale(-dyScreen * unitsPerPixelY));
+      .add(forward.scale(-dyScreen * unitsPerPixelY));
     camera.target.addInPlace(worldDelta);
   }
 

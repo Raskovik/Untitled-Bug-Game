@@ -12,6 +12,8 @@ import {
 } from "./api";
 import { WorldEditor } from "./editor";
 
+const TRAY_ITEM_MIME = "application/x-item-url";
+
 const loginGate = document.getElementById("login-gate") as HTMLDivElement;
 const topToolbar = document.getElementById("top-toolbar") as HTMLDivElement;
 const selectionToolbar = document.getElementById("selection-toolbar") as HTMLDivElement;
@@ -73,7 +75,6 @@ function startEditor(email: string): void {
   let selectedItem: DecorItem | Barrier | null = null;
   let selectedKind: "decor" | "barrier" | null = null;
   let editingEnabled = false;
-  let armedImageUrl: string | null = null;
   let libraryImages: UploadedImage[] = [];
   let pendingFile: File | null = null;
 
@@ -125,12 +126,10 @@ function startEditor(email: string): void {
     }
   });
 
-  function setTool(tool: "select" | "place" | "barrier", imageUrl?: string): void {
-    editor.setTool(tool, imageUrl);
-    armedImageUrl = tool === "place" ? (imageUrl ?? null) : null;
+  function setTool(tool: "select" | "barrier"): void {
+    editor.setTool(tool);
     const barrierBtn = document.getElementById("barrier-tool-btn") as HTMLButtonElement | null;
     if (barrierBtn) barrierBtn.classList.toggle("active", tool === "barrier");
-    renderTray();
   }
 
   function enterEditMode(): void {
@@ -294,10 +293,10 @@ function startEditor(email: string): void {
       thumb.src = resolveImageUrl(image.url);
       thumb.title = image.originalName;
       thumb.className = "tray-item";
-      thumb.classList.toggle("selected", image.url === armedImageUrl);
-      thumb.onclick = () => {
-        setTool("place", image.url);
-        setStatus(`Placing "${image.originalName}" — click the map to place it.`);
+      thumb.draggable = true;
+      thumb.ondragstart = (e) => {
+        e.dataTransfer?.setData(TRAY_ITEM_MIME, image.url);
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
       };
       itemTray.append(thumb);
     }
@@ -305,6 +304,7 @@ function startEditor(email: string): void {
 
   setupTrayScrolling();
   setupDropZone();
+  setupCanvasDrop();
 
   searchInput.oninput = () => renderTray();
 
@@ -312,37 +312,26 @@ function startEditor(email: string): void {
 
   function setupTrayScrolling(): void {
     let dragging = false;
-    let didDrag = false;
     let startX = 0;
     let startScroll = 0;
 
     itemTray.addEventListener("mousedown", (e) => {
+      // Only scroll-drag when grabbing empty tray space — dragging a thumbnail
+      // itself is a native HTML5 drag (placement), handled separately.
+      if ((e.target as HTMLElement).classList.contains("tray-item")) return;
       dragging = true;
-      didDrag = false;
       startX = e.pageX;
       startScroll = itemTray.scrollLeft;
       itemTray.classList.add("dragging");
     });
     window.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      const dx = e.pageX - startX;
-      if (Math.abs(dx) > 5) didDrag = true;
-      itemTray.scrollLeft = startScroll - dx;
+      itemTray.scrollLeft = startScroll - (e.pageX - startX);
     });
     window.addEventListener("mouseup", () => {
       dragging = false;
       itemTray.classList.remove("dragging");
     });
-    itemTray.addEventListener(
-      "click",
-      (e) => {
-        if (didDrag) {
-          e.stopPropagation();
-          e.preventDefault();
-        }
-      },
-      true
-    );
     itemTray.addEventListener(
       "wheel",
       (e) => {
@@ -394,6 +383,39 @@ function startEditor(email: string): void {
         uploadStatus.textContent = `Upload failed: ${(err as Error).message}`;
       }
     };
+  }
+
+  function setupCanvasDrop(): void {
+    canvas.addEventListener("dragover", (e) => {
+      if (!editingEnabled) return;
+      e.preventDefault();
+    });
+
+    canvas.addEventListener("drop", (e) => {
+      if (!editingEnabled) return;
+      e.preventDefault();
+
+      const rect = canvas.getBoundingClientRect();
+      const screenX = e.clientX - rect.left;
+      const screenY = e.clientY - rect.top;
+
+      const trayUrl = e.dataTransfer?.getData(TRAY_ITEM_MIME);
+      if (trayUrl) {
+        editor.placeDecor(screenX, screenY, trayUrl);
+        return;
+      }
+
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) return;
+
+      setStatus("Uploading...");
+      uploadImage(file)
+        .then(({ url }) => {
+          editor.placeDecor(screenX, screenY, url);
+          void refreshLibrary();
+        })
+        .catch((err: Error) => setStatus(`Upload failed: ${err.message}`));
+    });
   }
 
   function setPendingFile(file: File): void {
