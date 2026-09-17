@@ -171,6 +171,13 @@ function startEditor(): void {
     renderToolboxRow();
     renderTopToolbarEditMode();
     void refreshLibrary();
+
+    // Showing the toolbox/tray/add-item panel shrinks the canvas's CSS size
+    // (it shares space with them via flexbox), but that's not a window
+    // resize event, so Babylon never resizes its internal render buffer to
+    // match — leaving picking math using a stale resolution/aspect ratio
+    // while rendering just visually stretches to fit. Force it explicitly.
+    engine.resize();
   }
 
   function renderTopToolbarStart(): void {

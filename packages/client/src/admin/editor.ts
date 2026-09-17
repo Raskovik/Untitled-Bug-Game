@@ -2,10 +2,13 @@ import {
   Color3,
   Engine,
   HighlightLayer,
+  Material,
   Matrix,
   Mesh,
   MeshBuilder,
+  type PickingInfo,
   PointerEventTypes,
+  Quaternion,
   StandardMaterial,
   Texture,
   Vector3,
@@ -19,7 +22,8 @@ const LAYER_RENDER_GROUP: Record<DecorLayer, number> = { behind: 0, auto: 1, fro
 const BARRIER_HEIGHT = 0.05;
 const DUPLICATE_OFFSET = 1.5;
 const HISTORY_LIMIT = 100;
-const HOVER_GLOW_COLOR = new Color3(1, 0.9, 0.3);
+const HOVER_GLOW_COLOR = new Color3(1, 1, 1);
+const ALPHA_HIT_THRESHOLD = 32; // 0-255; pixels less opaque than this don't register hover/click
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 6;
 const PAN_SPEED = 12; // world units per second
@@ -52,6 +56,83 @@ interface ResizeStart {
   barrierDepth?: number;
 }
 
+interface AlphaMask {
+  width: number;
+  height: number;
+  data: Uint8ClampedArray;
+}
+
+/**
+ * Per-URL cache of each decor image's alpha channel, read once via an
+ * offscreen canvas (not GPU texture readback, which is async/slow). Used so
+ * hover/click only register on visibly opaque pixels, not the sprite
+ * plane's full transparent bounding square.
+ */
+const alphaMaskCache = new Map<string, AlphaMask | null>();
+const alphaMaskLoading = new Set<string>();
+
+function ensureAlphaMask(url: string): void {
+  if (alphaMaskCache.has(url) || alphaMaskLoading.has(url)) return;
+  alphaMaskLoading.add(url);
+
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no 2d context");
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      alphaMaskCache.set(url, { width: canvas.width, height: canvas.height, data: imageData.data });
+    } catch {
+      alphaMaskCache.set(url, null);
+    } finally {
+      alphaMaskLoading.delete(url);
+    }
+  };
+  img.onerror = () => {
+    alphaMaskCache.set(url, null);
+    alphaMaskLoading.delete(url);
+  };
+  img.src = url;
+}
+
+/** True unless the mask says this exact pixel is (close to) fully transparent. Fails open while loading. */
+function isOpaqueAt(url: string, u: number, v: number): boolean {
+  const mask = alphaMaskCache.get(url);
+  if (mask === undefined || mask === null) return true;
+  const x = clamp(Math.floor(u * mask.width), 0, mask.width - 1);
+  const y = clamp(Math.floor((1 - v) * mask.height), 0, mask.height - 1);
+  const alpha = mask.data[(y * mask.width + x) * 4 + 3];
+  return alpha >= ALPHA_HIT_THRESHOLD;
+}
+
+/**
+ * Babylon's dynamic `billboardMode` injects rotation directly into each
+ * frame's render-time world matrix without ever writing it back to
+ * `mesh.rotationQuaternion`. Rendering looks correct, but picking's
+ * bounding/intersection math reads `rotationQuaternion` and sees identity —
+ * so a billboarded decor sprite renders in the right place but is
+ * unpickable. Since this camera's angle never changes, the "face the
+ * camera" rotation is a constant: compute it once via a throwaway
+ * billboarded probe and apply it to every decor mesh as a real static
+ * rotation instead, which both renders and picks correctly.
+ */
+function computeFixedFacingRotation(gameScene: GameScene): Quaternion {
+  const probe = MeshBuilder.CreatePlane("__billboard_probe", { size: 1 }, gameScene.scene);
+  probe.billboardMode = Mesh.BILLBOARDMODE_ALL;
+  probe.computeWorldMatrix(true);
+  const scale = new Vector3();
+  const rotation = new Quaternion();
+  const translation = new Vector3();
+  probe.getWorldMatrix().decompose(scale, rotation, translation);
+  probe.dispose();
+  return rotation;
+}
+
 export class WorldEditor {
   private gameScene: GameScene;
   private decorMeshes = new Map<string, Mesh>();
@@ -76,6 +157,7 @@ export class WorldEditor {
   private hoveredId: string | null = null;
   private heldPanDirections = new Set<PanDirection>();
   private orthoSize = INITIAL_ORTHO_SIZE;
+  private decorRotation: Quaternion;
 
   constructor(
     private engine: Engine,
@@ -83,6 +165,7 @@ export class WorldEditor {
     private callbacks: EditorCallbacks
   ) {
     this.gameScene = createScene(engine, canvas);
+    this.decorRotation = computeFixedFacingRotation(this.gameScene);
     this.highlightLayer = new HighlightLayer("hoverHighlight", this.gameScene.scene);
     this.setupPointerHandling();
 
@@ -341,8 +424,21 @@ export class WorldEditor {
 
   private pickAnyMesh(): Mesh | null {
     const pick = this.gameScene.scene.pick(this.gameScene.scene.pointerX, this.gameScene.scene.pointerY);
+    return this.resolveOpaquePick(pick);
+  }
+
+  /** Rejects a hit on a decor sprite's transparent padding, treating it as a miss. */
+  private resolveOpaquePick(pick: PickingInfo | null): Mesh | null {
     if (!pick?.hit || !pick.pickedMesh) return null;
-    return pick.pickedMesh as Mesh;
+    const mesh = pick.pickedMesh as Mesh;
+
+    const imageUrl = mesh.metadata?.imageUrl as string | undefined;
+    if (!imageUrl) return mesh;
+
+    const uv = pick.getTextureCoordinates();
+    if (!uv) return mesh;
+
+    return isOpaqueAt(imageUrl, uv.x, uv.y) ? mesh : null;
   }
 
   private pickItem(): { id: string; kind: SelectionKind } | null {
@@ -584,15 +680,22 @@ export class WorldEditor {
   }
 
   private addDecorMesh(item: DecorItem): void {
+    const resolvedUrl = resolveImageUrl(item.imageUrl);
+    ensureAlphaMask(resolvedUrl);
+
     const mesh = MeshBuilder.CreatePlane(`decor-${item.id}`, { size: DECOR_SIZE }, this.gameScene.scene);
-    mesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    mesh.metadata = { decorId: item.id };
+    mesh.metadata = { decorId: item.id, imageUrl: resolvedUrl };
 
     const material = new StandardMaterial(`decor-mat-${item.id}`, this.gameScene.scene);
-    const texture = new Texture(resolveImageUrl(item.imageUrl), this.gameScene.scene);
+    const texture = new Texture(resolvedUrl, this.gameScene.scene);
     texture.hasAlpha = true;
     material.diffuseTexture = texture;
     material.useAlphaFromDiffuseTexture = true;
+    // Alpha-TEST (cutout) rather than alpha-blend: fully transparent pixels
+    // are discarded outright, so the hover glow's silhouette hugs the
+    // sprite's actual opaque shape instead of the whole rectangular plane.
+    material.transparencyMode = Material.MATERIAL_ALPHATEST;
+    material.alphaCutOff = ALPHA_HIT_THRESHOLD / 255;
     material.backFaceCulling = false;
     material.specularColor = Color3.Black();
     mesh.material = material;
@@ -606,7 +709,11 @@ export class WorldEditor {
     if (!mesh) return;
     mesh.position.set(item.x, DECOR_SIZE / 2, item.z);
     mesh.scaling.setAll(item.scale);
-    mesh.rotation.y = item.rotation;
+    // Roll around the plane's own normal first (its in-place spin from the
+    // Rotate tool), then apply the fixed camera-facing rotation on top —
+    // this keeps it always facing the camera while still visibly rotating.
+    const roll = Quaternion.RotationAxis(Vector3.Forward(), item.rotation);
+    mesh.rotationQuaternion = this.decorRotation.multiply(roll);
     mesh.renderingGroupId = LAYER_RENDER_GROUP[item.layer];
   }
 

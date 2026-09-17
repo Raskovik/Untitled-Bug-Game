@@ -29,7 +29,8 @@ const FIXED_RADIUS = 45;
 /** Half the height of the visible area, in world units — controls zoom level. */
 const ORTHO_SIZE = 12;
 
-const SKY_COLOR = new Color3(0.53, 0.72, 0.85);
+/** Flat solid ground color — no gradient, no lighting shading. */
+const GROUND_COLOR = new Color3(0.2, 0.45, 0.25);
 
 export interface GameScene {
   scene: Scene;
@@ -40,14 +41,7 @@ export interface GameScene {
 
 export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScene {
   const scene = new Scene(engine);
-  scene.clearColor.set(SKY_COLOR.r, SKY_COLOR.g, SKY_COLOR.b, 1);
-
-  // Fog fades the ground into the sky color before its edges ever reach the
-  // camera's view, so the world reads as continuous terrain instead of a
-  // floating plane with visible boundaries.
-  scene.fogMode = Scene.FOGMODE_EXP2;
-  scene.fogColor = SKY_COLOR;
-  scene.fogDensity = 0.012;
+  scene.clearColor.set(GROUND_COLOR.r, GROUND_COLOR.g, GROUND_COLOR.b, 1);
 
   const camera = new ArcRotateCamera(
     "mainCamera",
@@ -91,6 +85,9 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScen
 
 function createGroundMaterial(scene: Scene) {
   const material = new StandardMaterial("groundMaterial", scene);
-  material.diffuseColor = new Color3(0.2, 0.45, 0.25);
+  // Unlit/emissive so the ground is a perfectly flat solid color with no
+  // lighting-based shading variation across its surface.
+  material.disableLighting = true;
+  material.emissiveColor = GROUND_COLOR;
   return material;
 }
