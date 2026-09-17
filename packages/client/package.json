@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "npm --prefix ../shared run build",
     "dev": "vite",
+    "prebuild": "npm --prefix ../shared run build",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
