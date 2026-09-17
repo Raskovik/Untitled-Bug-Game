@@ -23,6 +23,11 @@ const DECOR_SIZE = 3;
 const LAYER_RENDER_GROUP: Record<DecorLayer, number> = { behind: 0, auto: 1, front: 2 };
 const LAYER_ORDER: DecorLayer[] = ["behind", "auto", "front"];
 const BARRIER_HEIGHT = 0.05;
+// A thin/narrow barrier (a fence line, a wall) has a footprint that's easy
+// to miss with the pointer, especially at this camera's oblique angle. The
+// visible rectangle stays exact; a separate invisible mesh this much larger
+// on each axis is what actually gets clicked/hovered.
+const BARRIER_PICK_PADDING = 0.6;
 const DUPLICATE_OFFSET = 1.5;
 const HISTORY_LIMIT = 100;
 const HOVER_GLOW_COLOR = new Color3(1, 1, 1);
@@ -161,6 +166,7 @@ export class WorldEditor {
   private gameScene: GameScene;
   private decorMeshes = new Map<string, Mesh>();
   private barrierMeshes = new Map<string, Mesh>();
+  private barrierPickMeshes = new Map<string, Mesh>();
   private decorItems: DecorItem[] = [];
   private barriers: Barrier[] = [];
   private mode: EditorMode = "decorate";
@@ -528,6 +534,8 @@ export class WorldEditor {
     } else if (kind === "barrier") {
       this.barrierMeshes.get(id)?.dispose();
       this.barrierMeshes.delete(id);
+      this.barrierPickMeshes.get(id)?.dispose();
+      this.barrierPickMeshes.delete(id);
       this.barriers = this.barriers.filter((b) => b.id !== id);
     }
     this.callbacks.onStatusChange("Deleted");
@@ -557,8 +565,10 @@ export class WorldEditor {
     this.clearHover();
     for (const mesh of this.decorMeshes.values()) mesh.dispose();
     for (const mesh of this.barrierMeshes.values()) mesh.dispose();
+    for (const mesh of this.barrierPickMeshes.values()) mesh.dispose();
     this.decorMeshes.clear();
     this.barrierMeshes.clear();
+    this.barrierPickMeshes.clear();
 
     this.decorItems = data.decor.map((item) => ({ ...item }));
     this.barriers = data.barriers.map((barrier) => ({ ...barrier }));
@@ -720,10 +730,8 @@ export class WorldEditor {
       }
     }
 
-    const mesh = this.pickAnyMesh();
-    const decorId = mesh?.metadata?.decorId as string | undefined;
-    const barrierId = mesh?.metadata?.barrierId as string | undefined;
-    const id = (allowedKind === "decor" ? decorId : barrierId) ?? null;
+    const mesh = this.pickItemMesh(allowedKind);
+    const id = (allowedKind === "decor" ? (mesh?.metadata?.decorId as string | undefined) : (mesh?.metadata?.barrierId as string | undefined)) ?? null;
 
     if (id !== this.hoveredId) {
       this.clearHover();
@@ -766,8 +774,19 @@ export class WorldEditor {
     return { x: pick.pickedPoint.x, z: pick.pickedPoint.z };
   }
 
-  private pickAnyMesh(): Mesh | null {
-    const pick = this.gameScene.scene.pick(this.gameScene.scene.pointerX, this.gameScene.scene.pointerY);
+  /**
+   * Picks only meshes of the given kind — decor sprites are invisible to a
+   * pick in barrier mode and vice versa, at the ray level, not just by
+   * rejecting the result afterward. A decor sprite sits well above the
+   * ground and can be the nearest hit along the ray even when a barrier
+   * occupies the same footprint underneath it; picking "whatever's nearest,
+   * then check its kind" would let that decor sprite silently swallow every
+   * click meant for the barrier beneath it.
+   */
+  private pickItemMesh(allowed: ItemKind): Mesh | null {
+    const { scene } = this.gameScene;
+    const metadataKey = allowed === "decor" ? "decorId" : "barrierId";
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => mesh.metadata?.[metadataKey] !== undefined);
     return this.resolveOpaquePick(pick);
   }
 
@@ -787,7 +806,7 @@ export class WorldEditor {
 
   /** Picks only meshes of the given kind (decor items are ignored in barrier mode and vice versa). */
   private pickItem(allowed: ItemKind): { id: string; kind: ItemKind } | null {
-    const mesh = this.pickAnyMesh();
+    const mesh = this.pickItemMesh(allowed);
     const decorId = mesh?.metadata?.decorId as string | undefined;
     const barrierId = mesh?.metadata?.barrierId as string | undefined;
     if (allowed === "decor" && decorId) return { id: decorId, kind: "decor" };
@@ -1054,6 +1073,9 @@ export class WorldEditor {
   private updateBarrierVisibility(): void {
     const visible = this.mode === "barrier" || this.showBarriersInDecorate;
     for (const mesh of this.barrierMeshes.values()) mesh.isVisible = visible;
+    // The pick proxy stays tied to the same visibility so a hidden barrier
+    // (in decorate mode, with the toggle off) is neither seen nor clickable.
+    for (const mesh of this.barrierPickMeshes.values()) mesh.isVisible = visible;
   }
 
   private addDecorMesh(item: DecorItem): void {
@@ -1068,10 +1090,13 @@ export class WorldEditor {
     texture.hasAlpha = true;
     material.diffuseTexture = texture;
     material.useAlphaFromDiffuseTexture = true;
-    // Alpha-TEST (cutout) rather than alpha-blend: fully transparent pixels
-    // are discarded outright, so the hover glow's silhouette hugs the
-    // sprite's actual opaque shape instead of the whole rectangular plane.
-    material.transparencyMode = Material.MATERIAL_ALPHATEST;
+    // Alpha-test-AND-blend: fully transparent pixels are discarded outright
+    // (so the hover glow's silhouette hugs the sprite's actual opaque shape
+    // instead of the whole rectangular plane), while pixels that pass the
+    // cutoff still alpha-blend normally using their real alpha value —
+    // pure alpha-test alone renders every passing pixel at full opacity,
+    // which is what made soft/anti-aliased edges look hard and "crunchy".
+    material.transparencyMode = Material.MATERIAL_ALPHATESTANDBLEND;
     material.alphaCutOff = ALPHA_HIT_THRESHOLD / 255;
     material.backFaceCulling = false;
     material.specularColor = Color3.Black();
@@ -1105,23 +1130,47 @@ export class WorldEditor {
   private addBarrierMesh(barrier: Barrier): void {
     const mesh = MeshBuilder.CreateGround(`barrier-${barrier.id}`, { width: 1, height: 1 }, this.gameScene.scene);
     mesh.metadata = { barrierId: barrier.id };
+    // The visual rectangle is never itself the pick target (see pickMesh
+    // below) — this avoids any ambiguity about which of the two overlapping
+    // meshes a click resolves to.
+    mesh.isPickable = false;
 
     const material = new StandardMaterial(`barrier-mat-${barrier.id}`, this.gameScene.scene);
     material.diffuseColor = new Color3(0.85, 0.2, 0.2);
     material.alpha = 0.4;
     mesh.material = material;
 
+    // An invisible, larger-than-the-real-rectangle mesh that's the actual
+    // click/hover target, so a thin barrier (a fence line, a wall) is easy
+    // to grab even though its true collision footprint stays exact.
+    const pickMesh = MeshBuilder.CreateGround(`barrier-pick-${barrier.id}`, { width: 1, height: 1 }, this.gameScene.scene);
+    pickMesh.metadata = { barrierId: barrier.id };
+    const pickMaterial = new StandardMaterial(`barrier-pick-mat-${barrier.id}`, this.gameScene.scene);
+    pickMaterial.alpha = 0;
+    pickMesh.material = pickMaterial;
+
     this.barrierMeshes.set(barrier.id, mesh);
+    this.barrierPickMeshes.set(barrier.id, pickMesh);
     this.refreshBarrierMesh(barrier);
     this.updateBarrierVisibility();
   }
 
   private refreshBarrierMesh(barrier: Barrier): void {
     const mesh = this.barrierMeshes.get(barrier.id);
-    if (!mesh) return;
+    const pickMesh = this.barrierPickMeshes.get(barrier.id);
+    if (!mesh || !pickMesh) return;
+
     mesh.position.set(barrier.x, BARRIER_HEIGHT, barrier.z);
     mesh.rotation.y = barrier.rotation;
     mesh.scaling.set(Math.max(0.01, barrier.width), 1, Math.max(0.01, barrier.depth));
+
+    pickMesh.position.copyFrom(mesh.position);
+    pickMesh.rotation.y = barrier.rotation;
+    pickMesh.scaling.set(
+      Math.max(0.01, barrier.width) + BARRIER_PICK_PADDING,
+      1,
+      Math.max(0.01, barrier.depth) + BARRIER_PICK_PADDING
+    );
   }
 }
 
