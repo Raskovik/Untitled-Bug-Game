@@ -30,16 +30,24 @@ const PAN_SPEED = 12; // world units per second
 const MIN_ORTHO_SIZE = 4;
 const MAX_ORTHO_SIZE = 40;
 const INITIAL_ORTHO_SIZE = 12;
+const HANDLE_SIZE = 0.5;
+const HANDLE_HEIGHT = 1.2;
+const HANDLE_MARGIN = 0.8;
+const ROTATE_HANDLE_COLOR = new Color3(0.3, 0.9, 1);
+const RESIZE_HANDLE_COLOR = new Color3(1, 0.55, 0.15);
 
 /**
- * A Pony Town-style toolbox: each tool does exactly one job, chosen
- * explicitly before acting on the map (hammer=place, crowbar=move,
- * wand=duplicate, broom=delete) rather than a generic "select" tool with
- * contextual buttons.
+ * A Pony Town-style toolbox for the one-off, deliberate actions (place,
+ * clone, delete, draw a barrier), plus a single "select" tool for the
+ * everyday work of fiddling with something you've already placed: click an
+ * item to select it (drag immediately to move it), and small on-item
+ * handles appear for rotate/resize so those don't need their own tool
+ * switches.
  */
-export type Tool = "hammer" | "crowbar" | "rotate" | "resize" | "wand" | "broom" | "barrier" | "inspect";
+export type Tool = "select" | "hammer" | "wand" | "broom" | "barrier";
 type SelectionKind = "decor" | "barrier" | null;
 type DragMode = "move" | "rotate" | "resize";
+type HandleType = "rotate" | "resize";
 export type PanDirection = "up" | "down" | "left" | "right";
 
 export interface EditorCallbacks {
@@ -139,10 +147,12 @@ export class WorldEditor {
   private barrierMeshes = new Map<string, Mesh>();
   private decorItems: DecorItem[] = [];
   private barriers: Barrier[] = [];
-  private tool: Tool = "crowbar";
+  private tool: Tool = "select";
   private armedImageUrl: string | null = null;
   private inspectedId: string | null = null;
   private inspectedKind: SelectionKind = null;
+  private rotateHandle: Mesh | null = null;
+  private resizeHandle: Mesh | null = null;
   private drawStart: { x: number; z: number } | null = null;
   private drawPreview: Mesh | null = null;
   private draggingId: string | null = null;
@@ -186,6 +196,7 @@ export class WorldEditor {
 
   render(): void {
     this.applyContinuousPan();
+    this.updateHandlePositions();
     this.gameScene.scene.render();
   }
 
@@ -375,10 +386,99 @@ export class WorldEditor {
     this.clearInspection();
   }
 
+  private selectItem(id: string, kind: SelectionKind): void {
+    this.inspectedId = id;
+    this.inspectedKind = kind;
+    const item =
+      kind === "decor"
+        ? (this.decorItems.find((d) => d.id === id) ?? null)
+        : (this.barriers.find((b) => b.id === id) ?? null);
+    this.callbacks.onInspect(item, kind);
+    this.showHandles();
+  }
+
   private clearInspection(): void {
     this.inspectedId = null;
     this.inspectedKind = null;
+    this.hideHandles();
     this.callbacks.onInspect(null, null);
+  }
+
+  private showHandles(): void {
+    this.hideHandles();
+    this.rotateHandle = this.createHandleMesh("rotate", ROTATE_HANDLE_COLOR);
+    this.resizeHandle = this.createHandleMesh("resize", RESIZE_HANDLE_COLOR);
+    this.updateHandlePositions();
+  }
+
+  private hideHandles(): void {
+    this.rotateHandle?.dispose();
+    this.resizeHandle?.dispose();
+    this.rotateHandle = null;
+    this.resizeHandle = null;
+  }
+
+  private createHandleMesh(type: HandleType, color: Color3): Mesh {
+    const mesh = MeshBuilder.CreateSphere(`handle-${type}`, { diameter: HANDLE_SIZE }, this.gameScene.scene);
+    mesh.metadata = { handleType: type };
+    mesh.renderingGroupId = 3;
+    const material = new StandardMaterial(`handle-mat-${type}`, this.gameScene.scene);
+    material.disableLighting = true;
+    material.emissiveColor = color;
+    mesh.material = material;
+    return mesh;
+  }
+
+  /** Keeps the rotate/resize handles glued to the selected item every frame, including mid-drag. */
+  private updateHandlePositions(): void {
+    if (!this.inspectedId || !this.rotateHandle || !this.resizeHandle) return;
+    const center = this.itemCenter(this.inspectedId, this.inspectedKind);
+    if (!center) return;
+
+    const radius = this.itemRadius(this.inspectedId, this.inspectedKind);
+    const { right, forward } = this.groundPanAxes();
+    this.rotateHandle.position.set(center.x + forward.x * radius, HANDLE_HEIGHT, center.z + forward.z * radius);
+    this.resizeHandle.position.set(center.x + right.x * radius, HANDLE_HEIGHT, center.z + right.z * radius);
+  }
+
+  private itemRadius(id: string, kind: SelectionKind): number {
+    if (kind === "decor") {
+      const item = this.decorItems.find((d) => d.id === id);
+      return item ? (DECOR_SIZE / 2) * item.scale + HANDLE_MARGIN : 2;
+    }
+    if (kind === "barrier") {
+      const barrier = this.barriers.find((b) => b.id === id);
+      return barrier ? Math.max(barrier.width, barrier.depth) / 2 + HANDLE_MARGIN : 2;
+    }
+    return 2;
+  }
+
+  /**
+   * Picks only the rotate/resize handle meshes, ignoring everything else in
+   * the scene. A generic nearest-hit pick would often lose to the selected
+   * item's own (larger, camera-facing) sprite, which can visually occlude a
+   * handle sitting right next to it — handles are UI controls and should
+   * always win regardless of depth.
+   */
+  private pickHandleType(): HandleType | null {
+    const { scene } = this.gameScene;
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => mesh === this.rotateHandle || mesh === this.resizeHandle);
+    if (!pick?.hit || !pick.pickedMesh) return null;
+    return (pick.pickedMesh.metadata?.handleType as HandleType | undefined) ?? null;
+  }
+
+  private beginResizeGesture(id: string, kind: SelectionKind): void {
+    const center = this.itemCenter(id, kind);
+    const point = this.pickGroundPoint();
+    if (!center || !point) return;
+    const distance = Math.hypot(point.x - center.x, point.z - center.z) || 0.01;
+    if (kind === "decor") {
+      const item = this.decorItems.find((d) => d.id === id);
+      this.resizeStart = { distance, decorScale: item?.scale ?? 1 };
+    } else if (kind === "barrier") {
+      const barrier = this.barriers.find((b) => b.id === id);
+      this.resizeStart = { distance, barrierWidth: barrier?.width ?? 1, barrierDepth: barrier?.depth ?? 1 };
+    }
   }
 
   private clearHover(): void {
@@ -478,54 +578,42 @@ export class WorldEditor {
       return;
     }
 
-    const picked = this.pickItem();
-
     if (this.tool === "wand") {
+      const picked = this.pickItem();
       if (picked) this.duplicate(picked.id, picked.kind);
       return;
     }
 
     if (this.tool === "broom") {
+      const picked = this.pickItem();
       if (picked) this.deleteItem(picked.id, picked.kind);
       return;
     }
 
-    if (this.tool === "inspect") {
-      if (picked) {
-        this.inspectedId = picked.id;
-        this.inspectedKind = picked.kind;
-        const item =
-          picked.kind === "decor"
-            ? (this.decorItems.find((d) => d.id === picked.id) ?? null)
-            : (this.barriers.find((b) => b.id === picked.id) ?? null);
-        this.callbacks.onInspect(item, picked.kind);
-      } else {
-        this.clearInspection();
+    // select tool: a click on an already-selected item's handle starts a
+    // rotate/resize gesture; a click on an item selects it and starts a
+    // move-drag immediately; a click on empty ground deselects.
+    if (this.inspectedId) {
+      const handleType = this.pickHandleType();
+      if (handleType) {
+        this.draggingId = this.inspectedId;
+        this.draggingKind = this.inspectedKind;
+        this.draggedDuringGesture = false;
+        this.dragMode = handleType;
+        if (handleType === "resize") this.beginResizeGesture(this.inspectedId, this.inspectedKind);
+        return;
       }
-      return;
     }
 
-    // crowbar / rotate / resize all start a drag on whatever was clicked.
-    if (!picked) return;
-
-    this.draggingId = picked.id;
-    this.draggingKind = picked.kind;
-    this.draggedDuringGesture = false;
-    this.dragMode = this.tool === "rotate" ? "rotate" : this.tool === "resize" ? "resize" : "move";
-
-    if (this.dragMode === "resize") {
-      const center = this.itemCenter(picked.id, picked.kind);
-      const point = this.pickGroundPoint();
-      if (center && point) {
-        const distance = Math.hypot(point.x - center.x, point.z - center.z) || 0.01;
-        if (picked.kind === "decor") {
-          const item = this.decorItems.find((d) => d.id === picked.id);
-          this.resizeStart = { distance, decorScale: item?.scale ?? 1 };
-        } else {
-          const barrier = this.barriers.find((b) => b.id === picked.id);
-          this.resizeStart = { distance, barrierWidth: barrier?.width ?? 1, barrierDepth: barrier?.depth ?? 1 };
-        }
-      }
+    const picked = this.pickItem();
+    if (picked) {
+      this.selectItem(picked.id, picked.kind);
+      this.draggingId = picked.id;
+      this.draggingKind = picked.kind;
+      this.draggedDuringGesture = false;
+      this.dragMode = "move";
+    } else {
+      this.clearInspection();
     }
   }
 

@@ -15,14 +15,15 @@ import { WorldEditor, type Tool } from "./editor";
 const TRAY_ITEM_MIME = "application/x-item-url";
 
 const TOOLS: { id: Tool; label: string; hint: string }[] = [
+  {
+    id: "select",
+    label: "Select",
+    hint: "Click an item to select it and drag to move — use the handles that appear to rotate or resize it.",
+  },
   { id: "hammer", label: "Hammer", hint: "Pick an item below, then click the map to place it (repeatable)." },
-  { id: "crowbar", label: "Move", hint: "Click and drag an item to reposition it." },
-  { id: "rotate", label: "Rotate", hint: "Click and drag an item to spin it around its center." },
-  { id: "resize", label: "Resize", hint: "Click and drag an item outward or inward to scale it." },
   { id: "wand", label: "Clone", hint: "Click an item to duplicate it." },
   { id: "broom", label: "Delete", hint: "Click an item to remove it." },
   { id: "barrier", label: "Barrier", hint: "Click and drag on the ground to draw a collision rectangle." },
-  { id: "inspect", label: "Inspect", hint: "Click an item to view/change its layer." },
 ];
 
 const loginGate = document.getElementById("login-gate") as HTMLDivElement;
@@ -148,6 +149,8 @@ function startEditor(): void {
 
     if (e.key === "Delete" || e.key === "Backspace") {
       editor.deleteInspected();
+    } else if (e.key === "Escape") {
+      editor.setTool("select");
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && e.shiftKey) {
       editor.redo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
@@ -236,7 +239,7 @@ function startEditor(): void {
       btn.textContent = tool.label;
       btn.className = "secondary";
       btn.dataset.tool = tool.id;
-      btn.classList.toggle("active", tool.id === "crowbar");
+      btn.classList.toggle("active", tool.id === "select");
       btn.onclick = () => editor.setTool(tool.id);
       toolboxRow.append(btn);
     }
