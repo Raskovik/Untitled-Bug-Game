@@ -261,17 +261,64 @@ function startEditor(): void {
     }
   }
 
+  function row(...children: HTMLElement[]): HTMLDivElement {
+    const el = document.createElement("div");
+    el.className = "inspect-row";
+    el.append(...children);
+    return el;
+  }
+
+  function iconButton(label: string, title: string, onClick: (e: MouseEvent) => void): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.textContent = label;
+    btn.title = title;
+    btn.className = "secondary";
+    btn.onclick = onClick;
+    return btn;
+  }
+
   function renderInspectPanel(): void {
     inspectPanel.innerHTML = "";
 
-    if (!inspectedItem || inspectedKind !== "decor") {
+    if (!inspectedItem || !inspectedKind) {
       inspectPanel.classList.add("hidden");
       return;
     }
 
+    if (inspectedKind === "barrier") {
+      const barrier = inspectedItem as Barrier;
+
+      const widthInput = document.createElement("input");
+      widthInput.type = "number";
+      widthInput.min = "0.2";
+      widthInput.step = "0.1";
+      widthInput.value = barrier.width.toFixed(1);
+      widthInput.onchange = () => {
+        const value = Math.max(0.2, Number(widthInput.value) || 0.2);
+        editor.updateInspected({ width: value });
+        editor.commitHistory();
+      };
+
+      const depthInput = document.createElement("input");
+      depthInput.type = "number";
+      depthInput.min = "0.2";
+      depthInput.step = "0.1";
+      depthInput.value = barrier.depth.toFixed(1);
+      depthInput.onchange = () => {
+        const value = Math.max(0.2, Number(depthInput.value) || 0.2);
+        editor.updateInspected({ depth: value });
+        editor.commitHistory();
+      };
+
+      inspectPanel.classList.remove("hidden");
+      inspectPanel.append(
+        row(labelSpan("Width:"), widthInput),
+        row(labelSpan("Depth:"), depthInput)
+      );
+      return;
+    }
+
     const item = inspectedItem as DecorItem;
-    const label = document.createElement("span");
-    label.textContent = "Layer:";
 
     const layerSelect = document.createElement("select");
     for (const [value, text] of [
@@ -290,8 +337,41 @@ function startEditor(): void {
       editor.commitHistory();
     };
 
+    const sizeInput = document.createElement("input");
+    sizeInput.type = "number";
+    sizeInput.min = "0.2";
+    sizeInput.max = "6";
+    sizeInput.step = "0.1";
+    sizeInput.value = item.scale.toFixed(2);
+    sizeInput.onchange = () => {
+      const value = Math.min(6, Math.max(0.2, Number(sizeInput.value) || 1));
+      editor.updateInspected({ scale: value });
+      editor.commitHistory();
+    };
+
     inspectPanel.classList.remove("hidden");
-    inspectPanel.append(label, layerSelect);
+    inspectPanel.append(
+      row(labelSpan("Layer:"), layerSelect),
+      row(
+        iconButton("⟲15°", "Rotate left 15° (Shift-click for 45°)", (e) => editor.rotateSelected(e.shiftKey ? -45 : -15)),
+        iconButton("15°⟳", "Rotate right 15° (Shift-click for 45°)", (e) => editor.rotateSelected(e.shiftKey ? 45 : 15)),
+        iconButton("⇋", "Flip horizontal", () => editor.flipSelected("horizontal")),
+        iconButton("⇵", "Flip vertical", () => editor.flipSelected("vertical"))
+      ),
+      row(labelSpan("Size:"), sizeInput),
+      row(
+        iconButton("⤒", "Send to very front", () => editor.adjustSelectedLayer("front")),
+        iconButton("↑", "Send forward one", () => editor.adjustSelectedLayer("forward")),
+        iconButton("↓", "Send back one", () => editor.adjustSelectedLayer("backward")),
+        iconButton("⤓", "Send to very back", () => editor.adjustSelectedLayer("back"))
+      )
+    );
+  }
+
+  function labelSpan(text: string): HTMLSpanElement {
+    const span = document.createElement("span");
+    span.textContent = text;
+    return span;
   }
 
   const refreshLibrary = async () => {

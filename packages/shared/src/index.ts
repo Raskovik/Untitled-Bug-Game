@@ -17,6 +17,9 @@ export interface DecorItem {
   rotation: number;
   scale: number;
   layer: DecorLayer;
+  /** Mirrors the sprite along its own local axis; undefined is equivalent to false. */
+  flipX?: boolean;
+  flipY?: boolean;
 }
 
 export interface Barrier {

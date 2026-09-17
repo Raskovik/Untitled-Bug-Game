@@ -20,6 +20,7 @@ import { resolveImageUrl } from "./api";
 
 const DECOR_SIZE = 3;
 const LAYER_RENDER_GROUP: Record<DecorLayer, number> = { behind: 0, auto: 1, front: 2 };
+const LAYER_ORDER: DecorLayer[] = ["behind", "auto", "front"];
 const BARRIER_HEIGHT = 0.05;
 const DUPLICATE_OFFSET = 1.5;
 const HISTORY_LIMIT = 100;
@@ -338,6 +339,54 @@ export class WorldEditor {
       x: center.x + axis.x * sign * NUDGE_STEP,
       z: center.z + axis.z * sign * NUDGE_STEP,
     });
+    this.pushHistory();
+  }
+
+  /** Rotates the selected decor item by an exact number of degrees (rotate-left/right buttons: 15° per click, 45° with Shift). */
+  rotateSelected(deltaDegrees: number): void {
+    if (!this.inspectedId || this.inspectedKind !== "decor") return;
+    const item = this.decorItems.find((d) => d.id === this.inspectedId);
+    if (!item) return;
+    item.rotation += (deltaDegrees * Math.PI) / 180;
+    this.refreshDecorMesh(item);
+    this.callbacks.onInspect(item, "decor");
+    this.pushHistory();
+  }
+
+  /** Mirrors the selected decor item along its own horizontal or vertical axis (like flipping a photograph). */
+  flipSelected(axis: "horizontal" | "vertical"): void {
+    if (!this.inspectedId || this.inspectedKind !== "decor") return;
+    const item = this.decorItems.find((d) => d.id === this.inspectedId);
+    if (!item) return;
+    if (axis === "horizontal") item.flipX = !item.flipX;
+    else item.flipY = !item.flipY;
+    this.refreshDecorMesh(item);
+    this.callbacks.onInspect(item, "decor");
+    this.pushHistory();
+  }
+
+  /**
+   * Nudges the selected decor item's layer by one step, or to either
+   * extreme — the exceptional-case override the spec calls for alongside
+   * the Layer dropdown's default-behavior setting; both edit the same
+   * three-tier behind/auto/front field.
+   */
+  adjustSelectedLayer(direction: "forward" | "backward" | "front" | "back"): void {
+    if (!this.inspectedId || this.inspectedKind !== "decor") return;
+    const item = this.decorItems.find((d) => d.id === this.inspectedId);
+    if (!item) return;
+    const currentIndex = LAYER_ORDER.indexOf(item.layer);
+    const nextIndex =
+      direction === "forward"
+        ? Math.min(LAYER_ORDER.length - 1, currentIndex + 1)
+        : direction === "backward"
+          ? Math.max(0, currentIndex - 1)
+          : direction === "front"
+            ? LAYER_ORDER.length - 1
+            : 0;
+    item.layer = LAYER_ORDER[nextIndex];
+    this.refreshDecorMesh(item);
+    this.callbacks.onInspect(item, "decor");
     this.pushHistory();
   }
 
@@ -1026,7 +1075,11 @@ export class WorldEditor {
     const mesh = this.decorMeshes.get(item.id);
     if (!mesh) return;
     mesh.position.set(item.x, DECOR_SIZE / 2, item.z);
-    mesh.scaling.setAll(item.scale);
+    // Negative scale on the plane's own local X/Y axis mirrors the sprite
+    // (like flipping a photograph) — applied before the roll/billboard
+    // rotation below, so a flip always mirrors the image itself regardless
+    // of whatever rotation angle is currently applied.
+    mesh.scaling.set(item.flipX ? -item.scale : item.scale, item.flipY ? -item.scale : item.scale, item.scale);
     // Roll around the plane's own normal first (its in-place spin from the
     // rotate handle), then apply the fixed camera-facing rotation on top —
     // this keeps it always facing the camera while still visibly rotating.

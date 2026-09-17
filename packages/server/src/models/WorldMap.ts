@@ -10,6 +10,8 @@ const decorItemSchema = new Schema<DecorItem>(
     rotation: { type: Number, required: true, default: 0 },
     scale: { type: Number, required: true, default: 1 },
     layer: { type: String, enum: ["behind", "auto", "front"] as DecorLayer[], default: "auto" },
+    flipX: { type: Boolean, default: false },
+    flipY: { type: Boolean, default: false },
   },
   { _id: false }
 );
