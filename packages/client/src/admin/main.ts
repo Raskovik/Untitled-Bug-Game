@@ -13,14 +13,20 @@ import {
 import { WorldEditor } from "./editor";
 
 const loginGate = document.getElementById("login-gate") as HTMLDivElement;
-const sidebar = document.getElementById("sidebar") as HTMLDivElement;
+const topToolbar = document.getElementById("top-toolbar") as HTMLDivElement;
+const selectionToolbar = document.getElementById("selection-toolbar") as HTMLDivElement;
+const statusLine = document.getElementById("status-line") as HTMLDivElement;
+const trayRow = document.getElementById("tray-row") as HTMLDivElement;
+const addItemPanel = document.getElementById("add-item-panel") as HTMLDivElement;
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
-
-const TOOL_HINTS: Record<string, string> = {
-  select: "Click an item to select it. Drag to move it.",
-  place: "Click the ground to place the image. Switch tools when done.",
-  barrier: "Click and drag on the ground to draw a collision rectangle.",
-};
+const itemTray = document.getElementById("item-tray") as HTMLDivElement;
+const searchInput = document.getElementById("search-items") as HTMLInputElement;
+const addBtn = document.getElementById("add-btn") as HTMLButtonElement;
+const dropZone = document.getElementById("drop-zone") as HTMLDivElement;
+const fileInput = document.getElementById("file-input") as HTMLInputElement;
+const itemNameInput = document.getElementById("item-name") as HTMLInputElement;
+const uploadBtn = document.getElementById("upload-btn") as HTMLButtonElement;
+const uploadStatus = document.getElementById("upload-status") as HTMLDivElement;
 
 async function main(): Promise<void> {
   const params = new URLSearchParams(window.location.search);
@@ -34,7 +40,6 @@ async function main(): Promise<void> {
   }
 
   loginGate.classList.add("hidden");
-  sidebar.classList.remove("hidden");
   startEditor(user.email);
 }
 
@@ -67,17 +72,21 @@ function startEditor(email: string): void {
 
   let selectedItem: DecorItem | Barrier | null = null;
   let selectedKind: "decor" | "barrier" | null = null;
+  let editingEnabled = false;
+  let armedImageUrl: string | null = null;
+  let libraryImages: UploadedImage[] = [];
+  let pendingFile: File | null = null;
 
   const setStatus = (message: string) => {
-    const el = document.getElementById("status");
-    if (el) el.textContent = message;
+    statusLine.textContent = message;
+    statusLine.classList.remove("hidden");
   };
 
   const editor = new WorldEditor(engine, canvas, {
     onSelectionChange: (item, kind) => {
       selectedItem = item;
       selectedKind = kind;
-      renderSelectionPanel();
+      renderSelectionToolbar();
     },
     onStatusChange: setStatus,
     onHistoryChange: (canUndo, canRedo) => {
@@ -88,14 +97,22 @@ function startEditor(email: string): void {
     },
   });
 
-  engine.runRenderLoop(() => editor.render());
+  engine.runRenderLoop(() => {
+    editor.render();
+    updateSelectionToolbarPosition();
+  });
   window.addEventListener("resize", () => engine.resize());
 
   window.addEventListener("keydown", (e) => {
+    if (!editingEnabled) return;
     const target = e.target as HTMLElement;
     if (target.tagName === "INPUT" || target.tagName === "SELECT") return;
 
-    if (e.key === "Delete" || e.key === "Backspace") {
+    if (e.shiftKey && e.key.startsWith("Arrow")) {
+      e.preventDefault();
+      const direction = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" } as const;
+      editor.panView(direction[e.key as keyof typeof direction]);
+    } else if (e.key === "Delete" || e.key === "Backspace") {
       editor.deleteSelected();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && e.shiftKey) {
       editor.redo();
@@ -108,41 +125,289 @@ function startEditor(email: string): void {
     }
   });
 
-  const handleSave = async () => {
-    setStatus("Saving...");
-    try {
-      await saveMap(editor.exportMap());
-      setStatus("Saved.");
-    } catch (err) {
-      setStatus(`Save failed: ${(err as Error).message}`);
-    }
-  };
-
   function setTool(tool: "select" | "place" | "barrier", imageUrl?: string): void {
     editor.setTool(tool, imageUrl);
-    const hint = document.getElementById("tool-hint");
-    if (hint) hint.textContent = TOOL_HINTS[tool] ?? "";
-    for (const btn of sidebar.querySelectorAll<HTMLButtonElement>("[data-tool]")) {
-      btn.classList.toggle("active", btn.dataset.tool === tool);
+    armedImageUrl = tool === "place" ? (imageUrl ?? null) : null;
+    const barrierBtn = document.getElementById("barrier-tool-btn") as HTMLButtonElement | null;
+    if (barrierBtn) barrierBtn.classList.toggle("active", tool === "barrier");
+    renderTray();
+  }
+
+  function enterEditMode(): void {
+    editingEnabled = true;
+    editor.setEditingEnabled(true);
+    trayRow.classList.remove("hidden");
+    addItemPanel.classList.remove("hidden");
+    renderTopToolbarEditMode();
+    void refreshLibrary();
+  }
+
+  function renderTopToolbarStart(): void {
+    topToolbar.innerHTML = "";
+    topToolbar.classList.remove("hidden");
+    const openBtn = document.createElement("button");
+    openBtn.textContent = "Open Editor";
+    openBtn.onclick = enterEditMode;
+    topToolbar.append(openBtn);
+  }
+
+  function renderTopToolbarEditMode(): void {
+    topToolbar.innerHTML = "";
+
+    const barrierBtn = document.createElement("button");
+    barrierBtn.id = "barrier-tool-btn";
+    barrierBtn.textContent = "Draw Barrier";
+    barrierBtn.className = "secondary";
+    barrierBtn.onclick = () => {
+      const isActive = barrierBtn.classList.contains("active");
+      setTool(isActive ? "select" : "barrier");
+    };
+
+    const undoBtn = document.createElement("button");
+    undoBtn.id = "undo-btn";
+    undoBtn.textContent = "Undo";
+    undoBtn.className = "secondary";
+    undoBtn.disabled = true;
+    undoBtn.onclick = () => editor.undo();
+
+    const redoBtn = document.createElement("button");
+    redoBtn.id = "redo-btn";
+    redoBtn.textContent = "Redo";
+    redoBtn.className = "secondary";
+    redoBtn.disabled = true;
+    redoBtn.onclick = () => editor.redo();
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = "Save Edit";
+    saveBtn.onclick = async () => {
+      setStatus("Saving...");
+      try {
+        await saveMap(editor.exportMap());
+        setStatus("Saved.");
+      } catch (err) {
+        setStatus(`Save failed: ${(err as Error).message}`);
+      }
+    };
+
+    const logoutBtn = document.createElement("button");
+    logoutBtn.textContent = "Log out";
+    logoutBtn.className = "secondary";
+    logoutBtn.onclick = async () => {
+      await logout();
+      window.location.reload();
+    };
+
+    topToolbar.append(barrierBtn, undoBtn, redoBtn, saveBtn, logoutBtn);
+  }
+
+  function renderSelectionToolbar(): void {
+    selectionToolbar.innerHTML = "";
+
+    if (!selectedItem || !selectedKind) {
+      selectionToolbar.classList.add("hidden");
+      return;
     }
+
+    const rotateBtn = document.createElement("button");
+    rotateBtn.textContent = "Rotate";
+    rotateBtn.className = "secondary";
+    rotateBtn.onclick = () => editor.beginRotate();
+
+    const resizeBtn = document.createElement("button");
+    resizeBtn.textContent = "Resize";
+    resizeBtn.className = "secondary";
+    resizeBtn.onclick = () => editor.beginResize();
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.textContent = "Delete";
+    deleteBtn.className = "danger";
+    deleteBtn.onclick = () => editor.deleteSelected();
+
+    selectionToolbar.append(rotateBtn, resizeBtn);
+
+    if (selectedKind === "decor") {
+      const item = selectedItem as DecorItem;
+      const layerSelect = document.createElement("select");
+      for (const [value, label] of [
+        ["behind", "Behind"],
+        ["auto", "Auto"],
+        ["front", "Front"],
+      ] as const) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        option.selected = item.layer === value;
+        layerSelect.append(option);
+      }
+      layerSelect.onchange = () => {
+        editor.updateSelected({ layer: layerSelect.value as DecorItem["layer"] });
+        editor.commitHistory();
+      };
+      selectionToolbar.append(layerSelect);
+    }
+
+    selectionToolbar.append(deleteBtn);
+  }
+
+  function updateSelectionToolbarPosition(): void {
+    if (!editingEnabled) {
+      selectionToolbar.classList.add("hidden");
+      return;
+    }
+    const pos = editor.getSelectedScreenPosition();
+    if (!pos) {
+      selectionToolbar.classList.add("hidden");
+      return;
+    }
+    selectionToolbar.classList.remove("hidden");
+    selectionToolbar.style.left = `${pos.x}px`;
+    selectionToolbar.style.top = `${pos.y}px`;
   }
 
   const refreshLibrary = async () => {
-    const library = document.getElementById("image-library") as HTMLDivElement | null;
-    if (!library) return;
     try {
-      const images = await listUploads();
-      renderImageLibrary(library, images, (url) => {
-        setTool("place", url);
-        setStatus("Click the ground to place it.");
-      });
+      libraryImages = await listUploads();
     } catch {
-      // Image library is a convenience feature; silently skip if it can't load.
+      libraryImages = [];
     }
+    renderTray();
   };
 
-  buildSidebar(email, editor, setStatus, handleSave, setTool);
-  void refreshLibrary();
+  function renderTray(): void {
+    const query = searchInput.value.trim().toLowerCase();
+    const filtered = query
+      ? libraryImages.filter((image) => image.originalName.toLowerCase().includes(query))
+      : libraryImages;
+
+    itemTray.innerHTML = "";
+
+    if (filtered.length === 0) {
+      const hint = document.createElement("div");
+      hint.className = "empty-hint";
+      hint.textContent = libraryImages.length === 0 ? "No items yet — add one on the right." : "No matches.";
+      itemTray.append(hint);
+      return;
+    }
+
+    for (const image of filtered) {
+      const thumb = document.createElement("img");
+      thumb.src = resolveImageUrl(image.url);
+      thumb.title = image.originalName;
+      thumb.className = "tray-item";
+      thumb.classList.toggle("selected", image.url === armedImageUrl);
+      thumb.onclick = () => {
+        setTool("place", image.url);
+        setStatus(`Placing "${image.originalName}" — click the map to place it.`);
+      };
+      itemTray.append(thumb);
+    }
+  }
+
+  setupTrayScrolling();
+  setupDropZone();
+
+  searchInput.oninput = () => renderTray();
+
+  addBtn.onclick = () => fileInput.click();
+
+  function setupTrayScrolling(): void {
+    let dragging = false;
+    let didDrag = false;
+    let startX = 0;
+    let startScroll = 0;
+
+    itemTray.addEventListener("mousedown", (e) => {
+      dragging = true;
+      didDrag = false;
+      startX = e.pageX;
+      startScroll = itemTray.scrollLeft;
+      itemTray.classList.add("dragging");
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const dx = e.pageX - startX;
+      if (Math.abs(dx) > 5) didDrag = true;
+      itemTray.scrollLeft = startScroll - dx;
+    });
+    window.addEventListener("mouseup", () => {
+      dragging = false;
+      itemTray.classList.remove("dragging");
+    });
+    itemTray.addEventListener(
+      "click",
+      (e) => {
+        if (didDrag) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      },
+      true
+    );
+    itemTray.addEventListener(
+      "wheel",
+      (e) => {
+        if (e.deltaY !== 0) {
+          itemTray.scrollLeft += e.deltaY;
+          e.preventDefault();
+        }
+      },
+      { passive: false }
+    );
+  }
+
+  function setupDropZone(): void {
+    dropZone.addEventListener("dblclick", () => fileInput.click());
+    dropZone.addEventListener("click", () => fileInput.click());
+
+    dropZone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropZone.classList.add("drag-over");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropZone.classList.remove("drag-over");
+      const file = e.dataTransfer?.files?.[0];
+      if (file) setPendingFile(file);
+    });
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (file) setPendingFile(file);
+    });
+
+    uploadBtn.onclick = async () => {
+      if (!pendingFile) {
+        uploadStatus.textContent = "Choose or drop an image first.";
+        return;
+      }
+      uploadStatus.textContent = "Uploading...";
+      try {
+        await uploadImage(pendingFile, itemNameInput.value.trim() || undefined);
+        uploadStatus.textContent = "Uploaded.";
+        pendingFile = null;
+        itemNameInput.value = "";
+        dropZone.textContent = "Drag image here, or click to upload";
+        fileInput.value = "";
+        void refreshLibrary();
+      } catch (err) {
+        uploadStatus.textContent = `Upload failed: ${(err as Error).message}`;
+      }
+    };
+  }
+
+  function setPendingFile(file: File): void {
+    pendingFile = file;
+    dropZone.innerHTML = "";
+    const preview = document.createElement("img");
+    preview.src = URL.createObjectURL(file);
+    dropZone.append(preview);
+    if (!itemNameInput.value) {
+      itemNameInput.value = file.name.replace(/\.[^.]+$/, "");
+    }
+  }
+
+  renderTopToolbarStart();
 
   getMap()
     .then((map) => {
@@ -150,354 +415,6 @@ function startEditor(email: string): void {
       setStatus(`Loaded map: ${map.decor.length} decor, ${map.barriers.length} barriers`);
     })
     .catch((err: Error) => setStatus(`Could not load map: ${err.message}`));
-
-  function renderSelectionPanel(): void {
-    const panel = document.getElementById("selection-panel") as HTMLDivElement;
-    panel.innerHTML = "";
-
-    if (!selectedItem || !selectedKind) {
-      panel.textContent = "Nothing selected. Click an item on the map to edit it.";
-      return;
-    }
-
-    const commit = () => editor.commitHistory();
-
-    if (selectedKind === "decor") {
-      const item = selectedItem as DecorItem;
-
-      panel.append(
-        positionFields(item.x, item.z, (x, z) => editor.updateSelected({ x, z }), commit),
-        field(
-          "Rotation",
-          rangeInput(
-            0,
-            360,
-            radToDeg(item.rotation),
-            (deg) => editor.updateSelected({ rotation: degToRad(deg) }),
-            1,
-            commit
-          )
-        ),
-        field(
-          "Scale",
-          rangeInput(0.2, 5, item.scale, (value) => editor.updateSelected({ scale: value }), 0.1, commit)
-        ),
-        field(
-          "Layer",
-          selectInput(
-            [
-              ["behind", "Behind"],
-              ["auto", "Auto (Y-sort)"],
-              ["front", "Front"],
-            ],
-            item.layer,
-            (value) => {
-              editor.updateSelected({ layer: value as DecorItem["layer"] });
-              commit();
-            }
-          )
-        )
-      );
-    } else {
-      const barrier = selectedItem as Barrier;
-      panel.append(
-        positionFields(barrier.x, barrier.z, (x, z) => editor.updateSelected({ x, z }), commit),
-        field(
-          "Width",
-          numberInput(barrier.width, (value) => editor.updateSelected({ width: value }), commit, 0.1)
-        ),
-        field(
-          "Depth",
-          numberInput(barrier.depth, (value) => editor.updateSelected({ depth: value }), commit, 0.1)
-        ),
-        field(
-          "Rotation",
-          rangeInput(
-            0,
-            360,
-            radToDeg(barrier.rotation),
-            (deg) => editor.updateSelected({ rotation: degToRad(deg) }),
-            1,
-            commit
-          )
-        )
-      );
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "action-row";
-
-    const duplicateButton = document.createElement("button");
-    duplicateButton.textContent = "Duplicate";
-    duplicateButton.className = "secondary";
-    duplicateButton.onclick = () => editor.duplicateSelected();
-
-    const deleteButton = document.createElement("button");
-    deleteButton.textContent = "Delete";
-    deleteButton.className = "danger";
-    deleteButton.onclick = () => editor.deleteSelected();
-
-    actions.append(duplicateButton, deleteButton);
-    panel.append(actions);
-  }
-
-  function buildSidebar(
-    userEmail: string,
-    worldEditor: WorldEditor,
-    status: (message: string) => void,
-    onSave: () => void,
-    onSetTool: (tool: "select" | "place" | "barrier", imageUrl?: string) => void
-  ): void {
-    sidebar.innerHTML = "";
-
-    const heading = document.createElement("h1");
-    heading.textContent = "World Editor";
-
-    const userLine = document.createElement("div");
-    userLine.style.fontSize = "12px";
-    userLine.style.color = "#9aa0a6";
-    userLine.textContent = userEmail;
-
-    const logoutButton = document.createElement("button");
-    logoutButton.textContent = "Log out";
-    logoutButton.className = "secondary";
-    logoutButton.style.marginTop = "8px";
-    logoutButton.onclick = async () => {
-      await logout();
-      window.location.reload();
-    };
-
-    sidebar.append(heading, userLine, logoutButton);
-
-    const historyRow = document.createElement("div");
-    historyRow.className = "action-row";
-    historyRow.style.marginTop = "16px";
-
-    const undoBtn = document.createElement("button");
-    undoBtn.id = "undo-btn";
-    undoBtn.textContent = "Undo";
-    undoBtn.className = "secondary";
-    undoBtn.disabled = true;
-    undoBtn.onclick = () => worldEditor.undo();
-
-    const redoBtn = document.createElement("button");
-    redoBtn.id = "redo-btn";
-    redoBtn.textContent = "Redo";
-    redoBtn.className = "secondary";
-    redoBtn.disabled = true;
-    redoBtn.onclick = () => worldEditor.redo();
-
-    historyRow.append(undoBtn, redoBtn);
-    sidebar.append(historyRow);
-
-    const toolsHeading = document.createElement("h2");
-    toolsHeading.textContent = "Tool";
-    sidebar.append(toolsHeading);
-
-    const selectBtn = toolButton("Select / Move", "select", () => onSetTool("select"));
-    const barrierBtn = toolButton("Draw Barrier", "barrier", () => onSetTool("barrier"));
-    selectBtn.classList.add("active");
-    sidebar.append(selectBtn, barrierBtn);
-
-    const hint = document.createElement("div");
-    hint.id = "tool-hint";
-    hint.textContent = TOOL_HINTS.select;
-    sidebar.append(hint);
-
-    const uploadHeading = document.createElement("h2");
-    uploadHeading.textContent = "Add Decor";
-    sidebar.append(uploadHeading);
-
-    const fileInput = document.createElement("input");
-    fileInput.type = "file";
-    fileInput.accept = "image/*";
-    fileInput.style.marginBottom = "8px";
-    fileInput.style.width = "100%";
-
-    const uploadBtn = document.createElement("button");
-    uploadBtn.textContent = "Upload & Place";
-    uploadBtn.onclick = async () => {
-      const file = fileInput.files?.[0];
-      if (!file) {
-        status("Choose an image file first.");
-        return;
-      }
-      status("Uploading...");
-      try {
-        const { url } = await uploadImage(file);
-        onSetTool("place", url);
-        status("Click the ground to place it.");
-        fileInput.value = "";
-        void refreshLibrary();
-      } catch (err) {
-        status(`Upload failed: ${(err as Error).message}`);
-      }
-    };
-
-    sidebar.append(fileInput, uploadBtn);
-
-    const libraryHeading = document.createElement("h2");
-    libraryHeading.textContent = "Your Images";
-    const library = document.createElement("div");
-    library.id = "image-library";
-    library.className = "thumb-grid";
-    library.textContent = "No images uploaded yet.";
-    sidebar.append(libraryHeading, library);
-
-    const selectionHeading = document.createElement("h2");
-    selectionHeading.textContent = "Selected";
-    const selectionPanel = document.createElement("div");
-    selectionPanel.id = "selection-panel";
-    selectionPanel.textContent = "Nothing selected. Click an item on the map to edit it.";
-    sidebar.append(selectionHeading, selectionPanel);
-
-    const saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save Map";
-    saveBtn.style.marginTop = "20px";
-    saveBtn.onclick = onSave;
-    sidebar.append(saveBtn);
-
-    const statusEl = document.createElement("div");
-    statusEl.id = "status";
-    sidebar.append(statusEl);
-  }
-}
-
-function renderImageLibrary(
-  container: HTMLDivElement,
-  images: UploadedImage[],
-  onPick: (url: string) => void
-): void {
-  container.innerHTML = "";
-
-  if (images.length === 0) {
-    container.textContent = "No images uploaded yet.";
-    return;
-  }
-
-  for (const image of images) {
-    const thumb = document.createElement("img");
-    thumb.src = resolveImageUrl(image.url);
-    thumb.title = image.originalName;
-    thumb.className = "thumb";
-    thumb.onclick = () => onPick(image.url);
-    container.append(thumb);
-  }
-}
-
-function toolButton(label: string, tool: string, onClick: () => void): HTMLButtonElement {
-  const button = document.createElement("button");
-  button.textContent = label;
-  button.className = "secondary";
-  button.dataset.tool = tool;
-  button.style.marginBottom = "8px";
-  button.onclick = onClick;
-  return button;
-}
-
-function field(labelText: string, input: HTMLElement): HTMLDivElement {
-  const wrapper = document.createElement("div");
-  wrapper.className = "field";
-  const label = document.createElement("label");
-  label.textContent = labelText;
-  wrapper.append(label, input);
-  return wrapper;
-}
-
-function positionFields(
-  x: number,
-  z: number,
-  onChange: (x: number, z: number) => void,
-  onCommit: () => void
-): HTMLDivElement {
-  const wrapper = document.createElement("div");
-  wrapper.className = "field";
-
-  const label = document.createElement("label");
-  label.textContent = "Position (X, Z)";
-
-  const row = document.createElement("div");
-  row.style.display = "flex";
-  row.style.gap = "6px";
-
-  const xInput = document.createElement("input");
-  xInput.type = "number";
-  xInput.step = "0.1";
-  xInput.value = x.toFixed(1);
-
-  const zInput = document.createElement("input");
-  zInput.type = "number";
-  zInput.step = "0.1";
-  zInput.value = z.toFixed(1);
-
-  const handleInput = () => onChange(Number(xInput.value), Number(zInput.value));
-  xInput.oninput = handleInput;
-  zInput.oninput = handleInput;
-  xInput.onchange = onCommit;
-  zInput.onchange = onCommit;
-
-  row.append(xInput, zInput);
-  wrapper.append(label, row);
-  return wrapper;
-}
-
-function rangeInput(
-  min: number,
-  max: number,
-  value: number,
-  onChange: (value: number) => void,
-  step: number,
-  onCommit: () => void
-): HTMLInputElement {
-  const input = document.createElement("input");
-  input.type = "range";
-  input.min = String(min);
-  input.max = String(max);
-  input.step = String(step);
-  input.value = String(value);
-  input.oninput = () => onChange(Number(input.value));
-  input.onchange = onCommit;
-  return input;
-}
-
-function numberInput(
-  value: number,
-  onChange: (value: number) => void,
-  onCommit: () => void,
-  step = 1
-): HTMLInputElement {
-  const input = document.createElement("input");
-  input.type = "number";
-  input.step = String(step);
-  input.value = String(value);
-  input.oninput = () => onChange(Number(input.value));
-  input.onchange = onCommit;
-  return input;
-}
-
-function selectInput(
-  options: [string, string][],
-  value: string,
-  onChange: (value: string) => void
-): HTMLSelectElement {
-  const select = document.createElement("select");
-  for (const [optValue, label] of options) {
-    const option = document.createElement("option");
-    option.value = optValue;
-    option.textContent = label;
-    option.selected = optValue === value;
-    select.append(option);
-  }
-  select.onchange = () => onChange(select.value);
-  return select;
-}
-
-function degToRad(deg: number): number {
-  return (deg * Math.PI) / 180;
-}
-
-function radToDeg(rad: number): number {
-  return (rad * 180) / Math.PI;
 }
 
 void main();

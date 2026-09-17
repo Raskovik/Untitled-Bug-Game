@@ -1,11 +1,14 @@
 import {
   Color3,
   Engine,
+  HighlightLayer,
+  Matrix,
   Mesh,
   MeshBuilder,
   PointerEventTypes,
   StandardMaterial,
   Texture,
+  Vector3,
 } from "@babylonjs/core";
 import type { Barrier, DecorItem, DecorLayer, WorldMapData } from "@bug-game/shared";
 import { createScene, type GameScene } from "../scene";
@@ -16,14 +19,27 @@ const LAYER_RENDER_GROUP: Record<DecorLayer, number> = { behind: 0, auto: 1, fro
 const BARRIER_HEIGHT = 0.05;
 const DUPLICATE_OFFSET = 1.5;
 const HISTORY_LIMIT = 100;
+const HOVER_GLOW_COLOR = new Color3(1, 0.9, 0.3);
+const MIN_SCALE = 0.2;
+const MAX_SCALE = 6;
+const KEY_PAN_STEP = 3;
 
 type Tool = "select" | "place" | "barrier";
 type SelectionKind = "decor" | "barrier" | null;
+type DragMode = "move" | "rotate" | "resize";
+type PanDirection = "up" | "down" | "left" | "right";
 
 export interface EditorCallbacks {
   onSelectionChange: (item: DecorItem | Barrier | null, kind: SelectionKind) => void;
   onStatusChange: (message: string) => void;
   onHistoryChange: (canUndo: boolean, canRedo: boolean) => void;
+}
+
+interface ResizeStart {
+  distance: number;
+  decorScale?: number;
+  barrierWidth?: number;
+  barrierDepth?: number;
 }
 
 export class WorldEditor {
@@ -40,15 +56,23 @@ export class WorldEditor {
   private drawPreview: Mesh | null = null;
   private draggingId: string | null = null;
   private draggedDuringGesture = false;
+  private dragMode: DragMode = "move";
+  private pendingInteraction: "rotate" | "resize" | null = null;
+  private resizeStart: ResizeStart | null = null;
   private history: WorldMapData[] = [];
   private historyIndex = -1;
+  private editingEnabled = false;
+  private highlightLayer: HighlightLayer;
+  private hoveredId: string | null = null;
+  private panLastScreen: { x: number; y: number } | null = null;
 
   constructor(
-    engine: Engine,
+    private engine: Engine,
     canvas: HTMLCanvasElement,
     private callbacks: EditorCallbacks
   ) {
     this.gameScene = createScene(engine, canvas);
+    this.highlightLayer = new HighlightLayer("hoverHighlight", this.gameScene.scene);
     this.setupPointerHandling();
   }
 
@@ -58,6 +82,14 @@ export class WorldEditor {
 
   render(): void {
     this.gameScene.scene.render();
+  }
+
+  setEditingEnabled(enabled: boolean): void {
+    this.editingEnabled = enabled;
+    if (!enabled) {
+      this.clearSelection();
+      this.clearHover();
+    }
   }
 
   loadMap(data: WorldMapData): void {
@@ -75,6 +107,49 @@ export class WorldEditor {
     this.tool = tool;
     this.pendingImageUrl = tool === "place" ? (imageUrl ?? null) : null;
     this.clearSelection();
+  }
+
+  /** Arms a one-shot rotate gesture: the next canvas drag rotates the selected item. */
+  beginRotate(): void {
+    if (!this.selectedId) return;
+    this.pendingInteraction = "rotate";
+  }
+
+  /** Arms a one-shot resize gesture: the next canvas drag resizes the selected item. */
+  beginResize(): void {
+    if (!this.selectedId) return;
+    this.pendingInteraction = "resize";
+  }
+
+  /** Screen-space position (px) of the current selection, for positioning a floating toolbar. Null if nothing selected. */
+  getSelectedScreenPosition(): { x: number; y: number } | null {
+    if (!this.selectedId) return null;
+    const mesh = this.decorMeshes.get(this.selectedId) ?? this.barrierMeshes.get(this.selectedId);
+    if (!mesh) return null;
+
+    const { scene, camera } = this.gameScene;
+    const viewport = camera.viewport.toGlobal(this.engine.getRenderWidth(), this.engine.getRenderHeight());
+    const projected = Vector3.Project(
+      mesh.getAbsolutePosition(),
+      Matrix.Identity(),
+      scene.getTransformMatrix(),
+      viewport
+    );
+    return { x: projected.x, y: projected.y };
+  }
+
+  /** Pans the camera one fixed step in the given screen-relative direction (for keyboard shortcuts). */
+  panView(direction: PanDirection): void {
+    const { camera } = this.gameScene;
+    const right = camera.getDirection(Vector3.Right());
+    const up = camera.getDirection(Vector3.Up());
+    const stepVector: Record<PanDirection, Vector3> = {
+      up: up.scale(KEY_PAN_STEP),
+      down: up.scale(-KEY_PAN_STEP),
+      left: right.scale(-KEY_PAN_STEP),
+      right: right.scale(KEY_PAN_STEP),
+    };
+    camera.target.addInPlace(stepVector[direction]);
   }
 
   updateSelected(patch: Partial<DecorItem> | Partial<Barrier>): void {
@@ -137,6 +212,8 @@ export class WorldEditor {
   deleteSelected(): void {
     if (!this.selectedId) return;
 
+    if (this.hoveredId === this.selectedId) this.clearHover();
+
     if (this.selectedKind === "decor") {
       this.decorMeshes.get(this.selectedId)?.dispose();
       this.decorMeshes.delete(this.selectedId);
@@ -187,6 +264,7 @@ export class WorldEditor {
   }
 
   private applyMapData(data: WorldMapData): void {
+    this.clearHover();
     for (const mesh of this.decorMeshes.values()) mesh.dispose();
     for (const mesh of this.barrierMeshes.values()) mesh.dispose();
     this.decorMeshes.clear();
@@ -204,23 +282,47 @@ export class WorldEditor {
   private clearSelection(): void {
     this.selectedId = null;
     this.selectedKind = null;
+    this.pendingInteraction = null;
     this.callbacks.onSelectionChange(null, null);
   }
 
+  private clearHover(): void {
+    if (!this.hoveredId) return;
+    const mesh = this.decorMeshes.get(this.hoveredId) ?? this.barrierMeshes.get(this.hoveredId);
+    if (mesh) this.highlightLayer.removeMesh(mesh);
+    this.hoveredId = null;
+  }
+
+  private updateHover(): void {
+    const mesh = this.pickAnyMesh();
+    const id = (mesh?.metadata?.decorId as string | undefined) ?? (mesh?.metadata?.barrierId as string | undefined) ?? null;
+
+    if (id === this.hoveredId) return;
+    this.clearHover();
+
+    if (id) {
+      const newMesh = this.decorMeshes.get(id) ?? this.barrierMeshes.get(id);
+      if (newMesh) {
+        this.highlightLayer.addMesh(newMesh, HOVER_GLOW_COLOR);
+        this.hoveredId = id;
+      }
+    }
+  }
+
   private setupPointerHandling(): void {
-    const { scene, ground } = this.gameScene;
+    const { scene } = this.gameScene;
 
     scene.onPointerObservable.add((pointerInfo) => {
+      if (!this.editingEnabled) return;
+
       if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
-        this.handlePointerDown();
+        this.handlePointerDown(Boolean(pointerInfo.event.shiftKey));
       } else if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
         this.handlePointerMove();
       } else if (pointerInfo.type === PointerEventTypes.POINTERUP) {
         this.handlePointerUp();
       }
     });
-
-    void ground;
   }
 
   private pickGroundPoint(): { x: number; z: number } | null {
@@ -242,7 +344,48 @@ export class WorldEditor {
     return pick.pickedMesh as Mesh;
   }
 
-  private handlePointerDown(): void {
+  private itemCenter(id: string, kind: SelectionKind): { x: number; z: number } | null {
+    if (kind === "decor") {
+      const item = this.decorItems.find((d) => d.id === id);
+      return item ? { x: item.x, z: item.z } : null;
+    }
+    if (kind === "barrier") {
+      const barrier = this.barriers.find((b) => b.id === id);
+      return barrier ? { x: barrier.x, z: barrier.z } : null;
+    }
+    return null;
+  }
+
+  private handlePointerDown(shiftKey: boolean): void {
+    if (shiftKey) {
+      this.panLastScreen = { x: this.gameScene.scene.pointerX, y: this.gameScene.scene.pointerY };
+      return;
+    }
+
+    if (this.pendingInteraction && this.selectedId) {
+      const center = this.itemCenter(this.selectedId, this.selectedKind);
+      const point = this.pickGroundPoint();
+      if (!center || !point) return;
+
+      this.draggingId = this.selectedId;
+      this.draggedDuringGesture = false;
+      this.dragMode = this.pendingInteraction;
+
+      if (this.pendingInteraction === "resize") {
+        const distance = Math.hypot(point.x - center.x, point.z - center.z) || 0.01;
+        if (this.selectedKind === "decor") {
+          const item = this.decorItems.find((d) => d.id === this.selectedId);
+          this.resizeStart = { distance, decorScale: item?.scale ?? 1 };
+        } else {
+          const barrier = this.barriers.find((b) => b.id === this.selectedId);
+          this.resizeStart = { distance, barrierWidth: barrier?.width ?? 1, barrierDepth: barrier?.depth ?? 1 };
+        }
+      }
+
+      this.pendingInteraction = null;
+      return;
+    }
+
     if (this.tool === "place" && this.pendingImageUrl) {
       const point = this.pickGroundPoint();
       if (!point) return;
@@ -284,6 +427,7 @@ export class WorldEditor {
       this.selectedKind = "decor";
       this.draggingId = decorId;
       this.draggedDuringGesture = false;
+      this.dragMode = "move";
       const item = this.decorItems.find((d) => d.id === decorId) ?? null;
       this.callbacks.onSelectionChange(item, "decor");
     } else if (barrierId) {
@@ -291,6 +435,7 @@ export class WorldEditor {
       this.selectedKind = "barrier";
       this.draggingId = barrierId;
       this.draggedDuringGesture = false;
+      this.dragMode = "move";
       const barrier = this.barriers.find((b) => b.id === barrierId) ?? null;
       this.callbacks.onSelectionChange(barrier, "barrier");
     } else {
@@ -299,35 +444,92 @@ export class WorldEditor {
   }
 
   private handlePointerMove(): void {
+    if (this.panLastScreen) {
+      const { scene } = this.gameScene;
+      const dxScreen = scene.pointerX - this.panLastScreen.x;
+      const dyScreen = scene.pointerY - this.panLastScreen.y;
+      this.applyScreenPan(dxScreen, dyScreen);
+      this.panLastScreen = { x: scene.pointerX, y: scene.pointerY };
+      return;
+    }
+
     if (this.tool === "select" && this.draggingId) {
       const point = this.pickGroundPoint();
       if (!point) return;
-      this.updateSelected({ x: point.x, z: point.z });
+
+      if (this.dragMode === "move") {
+        this.updateSelected({ x: point.x, z: point.z });
+      } else if (this.dragMode === "rotate") {
+        const center = this.itemCenter(this.draggingId, this.selectedKind);
+        if (center) {
+          const angle = Math.atan2(point.x - center.x, point.z - center.z);
+          this.updateSelected({ rotation: angle });
+        }
+      } else if (this.dragMode === "resize" && this.resizeStart) {
+        const center = this.itemCenter(this.draggingId, this.selectedKind);
+        if (center) {
+          const distance = Math.hypot(point.x - center.x, point.z - center.z);
+          const factor = distance / this.resizeStart.distance;
+          if (this.selectedKind === "decor" && this.resizeStart.decorScale !== undefined) {
+            const scale = clamp(this.resizeStart.decorScale * factor, MIN_SCALE, MAX_SCALE);
+            this.updateSelected({ scale });
+          } else if (
+            this.selectedKind === "barrier" &&
+            this.resizeStart.barrierWidth !== undefined &&
+            this.resizeStart.barrierDepth !== undefined
+          ) {
+            this.updateSelected({
+              width: Math.max(0.2, this.resizeStart.barrierWidth * factor),
+              depth: Math.max(0.2, this.resizeStart.barrierDepth * factor),
+            });
+          }
+        }
+      }
+
       this.draggedDuringGesture = true;
       return;
     }
 
-    if (this.tool !== "barrier" || !this.drawStart) return;
+    if (this.tool === "barrier" && this.drawStart) {
+      const point = this.pickGroundPoint();
+      if (!point) return;
 
-    const point = this.pickGroundPoint();
-    if (!point) return;
+      this.drawPreview?.dispose();
+      this.drawPreview = MeshBuilder.CreateGround(
+        "barrier-preview",
+        {
+          width: Math.max(0.1, Math.abs(point.x - this.drawStart.x)),
+          height: Math.max(0.1, Math.abs(point.z - this.drawStart.z)),
+        },
+        this.gameScene.scene
+      );
+      this.drawPreview.position.set(
+        (this.drawStart.x + point.x) / 2,
+        BARRIER_HEIGHT,
+        (this.drawStart.z + point.z) / 2
+      );
+      const material = new StandardMaterial("barrier-preview-mat", this.gameScene.scene);
+      material.diffuseColor = new Color3(0.85, 0.2, 0.2);
+      material.alpha = 0.4;
+      this.drawPreview.material = material;
+      return;
+    }
 
-    this.drawPreview?.dispose();
-    this.drawPreview = this.createBarrierMesh({
-      id: "__preview__",
-      x: (this.drawStart.x + point.x) / 2,
-      z: (this.drawStart.z + point.z) / 2,
-      width: Math.max(0.1, Math.abs(point.x - this.drawStart.x)),
-      depth: Math.max(0.1, Math.abs(point.z - this.drawStart.z)),
-      rotation: 0,
-    });
+    if (this.tool === "select" && !this.draggingId) {
+      this.updateHover();
+    }
   }
 
   private handlePointerUp(): void {
+    if (this.panLastScreen) {
+      this.panLastScreen = null;
+      return;
+    }
+
     if (this.tool === "select" && this.draggingId) {
       if (this.draggedDuringGesture) {
         this.pushHistory();
-        // Refresh the selection panel so numeric X/Z fields reflect the new position.
+        // Refresh the selection panel/toolbar so displayed values reflect the change.
         if (this.selectedKind === "decor") {
           const item = this.decorItems.find((d) => d.id === this.selectedId) ?? null;
           this.callbacks.onSelectionChange(item, "decor");
@@ -338,6 +540,8 @@ export class WorldEditor {
       }
       this.draggingId = null;
       this.draggedDuringGesture = false;
+      this.dragMode = "move";
+      this.resizeStart = null;
       return;
     }
 
@@ -370,6 +574,18 @@ export class WorldEditor {
     this.drawStart = null;
   }
 
+  private applyScreenPan(dxScreen: number, dyScreen: number): void {
+    const { camera } = this.gameScene;
+    const unitsPerPixelX = ((camera.orthoRight ?? 1) - (camera.orthoLeft ?? -1)) / this.engine.getRenderWidth();
+    const unitsPerPixelY = ((camera.orthoTop ?? 1) - (camera.orthoBottom ?? -1)) / this.engine.getRenderHeight();
+    const right = camera.getDirection(Vector3.Right());
+    const up = camera.getDirection(Vector3.Up());
+    const worldDelta = right
+      .scale(-dxScreen * unitsPerPixelX)
+      .add(up.scale(-dyScreen * unitsPerPixelY));
+    camera.target.addInPlace(worldDelta);
+  }
+
   private addDecorMesh(item: DecorItem): void {
     const mesh = MeshBuilder.CreatePlane(`decor-${item.id}`, { size: DECOR_SIZE }, this.gameScene.scene);
     mesh.billboardMode = Mesh.BILLBOARDMODE_ALL;
@@ -397,14 +613,8 @@ export class WorldEditor {
     mesh.renderingGroupId = LAYER_RENDER_GROUP[item.layer];
   }
 
-  private createBarrierMesh(barrier: Barrier): Mesh {
-    const mesh = MeshBuilder.CreateGround(
-      `barrier-${barrier.id}`,
-      { width: barrier.width, height: barrier.depth },
-      this.gameScene.scene
-    );
-    mesh.position.set(barrier.x, BARRIER_HEIGHT, barrier.z);
-    mesh.rotation.y = barrier.rotation;
+  private addBarrierMesh(barrier: Barrier): void {
+    const mesh = MeshBuilder.CreateGround(`barrier-${barrier.id}`, { width: 1, height: 1 }, this.gameScene.scene);
     mesh.metadata = { barrierId: barrier.id };
 
     const material = new StandardMaterial(`barrier-mat-${barrier.id}`, this.gameScene.scene);
@@ -412,18 +622,19 @@ export class WorldEditor {
     material.alpha = 0.4;
     mesh.material = material;
 
-    return mesh;
-  }
-
-  private addBarrierMesh(barrier: Barrier): void {
-    const mesh = this.createBarrierMesh(barrier);
     this.barrierMeshes.set(barrier.id, mesh);
+    this.refreshBarrierMesh(barrier);
   }
 
   private refreshBarrierMesh(barrier: Barrier): void {
     const mesh = this.barrierMeshes.get(barrier.id);
     if (!mesh) return;
-    mesh.dispose();
-    this.barrierMeshes.set(barrier.id, this.createBarrierMesh(barrier));
+    mesh.position.set(barrier.x, BARRIER_HEIGHT, barrier.z);
+    mesh.rotation.y = barrier.rotation;
+    mesh.scaling.set(Math.max(0.01, barrier.width), 1, Math.max(0.01, barrier.depth));
   }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }

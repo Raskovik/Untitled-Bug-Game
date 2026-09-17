@@ -40,12 +40,13 @@ adminRouter.post("/upload", upload.single("image"), async (req, res) => {
   }
 
   const url = `/uploads/${req.file.filename}`;
+  const name = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim() : req.file.originalname;
 
   if (isDatabaseConnected()) {
     await UploadedImage.create({
       id: randomUUID(),
       url,
-      originalName: req.file.originalname,
+      originalName: name,
     });
   }
 

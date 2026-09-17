@@ -40,9 +40,10 @@ export function saveMap(data: WorldMapData): Promise<{ ok: true }> {
   });
 }
 
-export async function uploadImage(file: File): Promise<{ url: string }> {
+export async function uploadImage(file: File, name?: string): Promise<{ url: string }> {
   const formData = new FormData();
   formData.append("image", file);
+  if (name) formData.append("name", name);
   return request("/admin/upload", { method: "POST", body: formData });
 }
 
