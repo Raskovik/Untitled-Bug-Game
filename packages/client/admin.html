@@ -164,8 +164,16 @@
       .tray-item:hover {
         border-color: #3c8dbc;
       }
-      .tray-item.armed {
-        border-color: #f0c33c;
+
+      #show-barriers-label {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: #9aa0a6;
+        cursor: pointer;
+        white-space: nowrap;
       }
 
       #add-item-panel {
@@ -279,6 +287,10 @@
           <input id="search-items" type="text" placeholder="Search items" />
           <button id="add-btn" class="secondary">Add</button>
           <div id="item-tray"></div>
+          <label id="show-barriers-label">
+            <input id="show-barriers-toggle" type="checkbox" />
+            Show barriers
+          </label>
         </div>
       </div>
       <div id="add-item-panel" class="hidden">

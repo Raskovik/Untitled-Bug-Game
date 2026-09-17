@@ -10,25 +10,18 @@ import {
   saveMap,
   uploadImage,
 } from "./api";
-import { WorldEditor, type Tool } from "./editor";
+import { BARRIER_BASE_HINT, DECORATE_BASE_HINT, type EditorMode, WorldEditor } from "./editor";
 
 const TRAY_ITEM_MIME = "application/x-item-url";
 
-const TOOLS: { id: Tool; label: string; hint: string }[] = [
-  {
-    id: "select",
-    label: "Select",
-    hint: "Click an item to select it and drag to move — use the handles that appear to rotate or resize it.",
-  },
-  { id: "hammer", label: "Hammer", hint: "Pick an item below, then click the map to place it (repeatable)." },
-  { id: "wand", label: "Clone", hint: "Click an item to duplicate it." },
-  { id: "broom", label: "Delete", hint: "Click an item to remove it." },
-  { id: "barrier", label: "Barrier", hint: "Click and drag on the ground to draw a collision rectangle." },
+const MODES: { id: EditorMode; label: string }[] = [
+  { id: "decorate", label: "Decorate" },
+  { id: "barrier", label: "Barrier" },
 ];
 
 const loginGate = document.getElementById("login-gate") as HTMLDivElement;
 const topToolbar = document.getElementById("top-toolbar") as HTMLDivElement;
-const toolboxRow = document.getElementById("toolbox-row") as HTMLDivElement;
+const modeRow = document.getElementById("toolbox-row") as HTMLDivElement;
 const inspectPanel = document.getElementById("inspect-panel") as HTMLDivElement;
 const statusLine = document.getElementById("status-line") as HTMLDivElement;
 const trayRow = document.getElementById("tray-row") as HTMLDivElement;
@@ -37,6 +30,7 @@ const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
 const itemTray = document.getElementById("item-tray") as HTMLDivElement;
 const searchInput = document.getElementById("search-items") as HTMLInputElement;
 const addBtn = document.getElementById("add-btn") as HTMLButtonElement;
+const showBarriersToggle = document.getElementById("show-barriers-toggle") as HTMLInputElement;
 const dropZone = document.getElementById("drop-zone") as HTMLDivElement;
 const fileInput = document.getElementById("file-input") as HTMLInputElement;
 const itemNameInput = document.getElementById("item-name") as HTMLInputElement;
@@ -90,7 +84,7 @@ function startEditor(): void {
   let editingEnabled = false;
   let libraryImages: UploadedImage[] = [];
   let pendingFile: File | null = null;
-  let armedImageUrl: string | null = null;
+  let draggingImageUrl: string | null = null;
 
   const setStatus = (message: string) => {
     statusLine.textContent = message;
@@ -110,28 +104,32 @@ function startEditor(): void {
       if (undoBtn) undoBtn.disabled = !canUndo;
       if (redoBtn) redoBtn.disabled = !canRedo;
     },
-    onToolChange: (tool, nextArmedImageUrl) => {
-      armedImageUrl = nextArmedImageUrl;
-      for (const btn of toolboxRow.querySelectorAll<HTMLButtonElement>("[data-tool]")) {
-        btn.classList.toggle("active", btn.dataset.tool === tool);
+    onModeChange: (mode) => {
+      for (const btn of modeRow.querySelectorAll<HTMLButtonElement>("[data-mode]")) {
+        btn.classList.toggle("active", btn.dataset.mode === mode);
       }
-      const hint = TOOLS.find((t) => t.id === tool)?.hint ?? "";
-      setStatus(hint);
-      renderTray(armedImageUrl);
+      trayRow.classList.toggle("hidden", mode !== "decorate");
+      addItemPanel.classList.toggle("hidden", mode !== "decorate");
+      setStatus(mode === "barrier" ? BARRIER_BASE_HINT : DECORATE_BASE_HINT);
     },
   });
 
   engine.runRenderLoop(() => editor.render());
   window.addEventListener("resize", () => engine.resize());
 
-  const PAN_KEYS: Record<string, "up" | "down" | "left" | "right"> = {
+  // Letter keys always pan the camera. Arrow keys pan too, unless something
+  // is selected, in which case they nudge the selected item instead — the
+  // two never compete because only one applies at a time.
+  const LETTER_PAN_KEYS: Record<string, "up" | "down" | "left" | "right"> = {
     w: "up",
-    arrowup: "up",
     s: "down",
-    arrowdown: "down",
     a: "left",
-    arrowleft: "left",
     d: "right",
+  };
+  const ARROW_KEYS: Record<string, "up" | "down" | "left" | "right"> = {
+    arrowup: "up",
+    arrowdown: "down",
+    arrowleft: "left",
     arrowright: "right",
   };
 
@@ -140,46 +138,64 @@ function startEditor(): void {
     const target = e.target as HTMLElement;
     if (target.tagName === "INPUT" || target.tagName === "SELECT") return;
 
-    const direction = PAN_KEYS[e.key.toLowerCase()];
-    if (direction) {
+    const modifierHeld = e.ctrlKey || e.metaKey;
+
+    const letterDirection = !modifierHeld ? LETTER_PAN_KEYS[e.key.toLowerCase()] : undefined;
+    if (letterDirection) {
       e.preventDefault();
-      editor.setPanKeyState(direction, true);
+      editor.setPanKeyState(letterDirection, true);
+      return;
+    }
+
+    const arrowDirection = ARROW_KEYS[e.key.toLowerCase()];
+    if (arrowDirection) {
+      e.preventDefault();
+      if (inspectedItem) {
+        editor.nudgeSelected(arrowDirection);
+      } else {
+        editor.setPanKeyState(arrowDirection, true);
+      }
       return;
     }
 
     if (e.key === "Delete" || e.key === "Backspace") {
       editor.deleteInspected();
     } else if (e.key === "Escape") {
-      editor.setTool("select");
+      editor.deselect();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && e.shiftKey) {
       editor.redo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
       editor.undo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
       editor.redo();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+      e.preventDefault();
+      editor.duplicateInspected();
     }
   });
 
   window.addEventListener("keyup", (e) => {
-    const direction = PAN_KEYS[e.key.toLowerCase()];
+    const direction = LETTER_PAN_KEYS[e.key.toLowerCase()] ?? ARROW_KEYS[e.key.toLowerCase()];
     if (direction) editor.setPanKeyState(direction, false);
   });
 
   function enterEditMode(): void {
     editingEnabled = true;
     editor.setEditingEnabled(true);
-    toolboxRow.classList.remove("hidden");
+    modeRow.classList.remove("hidden");
     trayRow.classList.remove("hidden");
     addItemPanel.classList.remove("hidden");
-    renderToolboxRow();
+    renderModeRow();
     renderTopToolbarEditMode();
     void refreshLibrary();
+    setStatus(DECORATE_BASE_HINT);
 
-    // Showing the toolbox/tray/add-item panel shrinks the canvas's CSS size
-    // (it shares space with them via flexbox), but that's not a window
-    // resize event, so Babylon never resizes its internal render buffer to
-    // match — leaving picking math using a stale resolution/aspect ratio
-    // while rendering just visually stretches to fit. Force it explicitly.
+    // Showing the mode row/tray/add-item panel shrinks the canvas's CSS
+    // size (it shares space with them via flexbox), but that's not a
+    // window resize event, so Babylon never resizes its internal render
+    // buffer to match — leaving picking math using a stale
+    // resolution/aspect ratio while rendering just visually stretches to
+    // fit. Force it explicitly.
     engine.resize();
   }
 
@@ -232,16 +248,16 @@ function startEditor(): void {
     topToolbar.append(undoBtn, redoBtn, saveBtn, logoutBtn);
   }
 
-  function renderToolboxRow(): void {
-    toolboxRow.innerHTML = "";
-    for (const tool of TOOLS) {
+  function renderModeRow(): void {
+    modeRow.innerHTML = "";
+    for (const mode of MODES) {
       const btn = document.createElement("button");
-      btn.textContent = tool.label;
+      btn.textContent = mode.label;
       btn.className = "secondary";
-      btn.dataset.tool = tool.id;
-      btn.classList.toggle("active", tool.id === "select");
-      btn.onclick = () => editor.setTool(tool.id);
-      toolboxRow.append(btn);
+      btn.dataset.mode = mode.id;
+      btn.classList.toggle("active", mode.id === "decorate");
+      btn.onclick = () => editor.setMode(mode.id);
+      modeRow.append(btn);
     }
   }
 
@@ -284,10 +300,10 @@ function startEditor(): void {
     } catch {
       libraryImages = [];
     }
-    renderTray(armedImageUrl);
+    renderTray();
   };
 
-  function renderTray(armedImageUrl: string | null): void {
+  function renderTray(): void {
     const query = searchInput.value.trim().toLowerCase();
     const filtered = query
       ? libraryImages.filter((image) => image.originalName.toLowerCase().includes(query))
@@ -308,15 +324,15 @@ function startEditor(): void {
       thumb.src = resolveImageUrl(image.url);
       thumb.title = image.originalName;
       thumb.className = "tray-item";
-      thumb.classList.toggle("armed", image.url === armedImageUrl);
       thumb.draggable = true;
       thumb.ondragstart = (e) => {
+        draggingImageUrl = image.url;
         e.dataTransfer?.setData(TRAY_ITEM_MIME, image.url);
         if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
       };
-      thumb.onclick = () => {
-        editor.armHammer(image.url);
-        setStatus(`Hammer holding "${image.originalName}" — click the map to place it.`);
+      thumb.ondragend = () => {
+        draggingImageUrl = null;
+        editor.hidePlacementGhost();
       };
       itemTray.append(thumb);
     }
@@ -326,9 +342,11 @@ function startEditor(): void {
   setupDropZone();
   setupCanvasDrop();
 
-  searchInput.oninput = () => renderTray(armedImageUrl);
+  searchInput.oninput = () => renderTray();
 
   addBtn.onclick = () => fileInput.click();
+
+  showBarriersToggle.onchange = () => editor.setShowBarriers(showBarriersToggle.checked);
 
   function setupTrayScrolling(): void {
     let dragging = false;
@@ -366,11 +384,22 @@ function startEditor(): void {
     canvas.addEventListener("dragover", (e) => {
       if (!editingEnabled) return;
       e.preventDefault();
+
+      if (draggingImageUrl) {
+        const rect = canvas.getBoundingClientRect();
+        editor.showPlacementGhost(e.clientX - rect.left, e.clientY - rect.top, draggingImageUrl);
+      }
+    });
+
+    canvas.addEventListener("dragleave", () => {
+      editor.hidePlacementGhost();
     });
 
     canvas.addEventListener("drop", (e) => {
       if (!editingEnabled) return;
       e.preventDefault();
+      editor.hidePlacementGhost();
+      draggingImageUrl = null;
 
       const rect = canvas.getBoundingClientRect();
       const screenX = e.clientX - rect.left;
