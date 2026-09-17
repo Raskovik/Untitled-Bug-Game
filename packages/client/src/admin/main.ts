@@ -1,9 +1,11 @@
 import { Engine } from "@babylonjs/core";
-import type { Barrier, DecorItem, UploadedImage } from "@bug-game/shared";
+import { UNCATEGORIZED, type Barrier, type DecorItem, type DecorLayer, type MapSlotSummary, type UploadedImage } from "@bug-game/shared";
 import {
+  deleteMapSlot,
   getCurrentUser,
   getMap,
   googleLoginUrl,
+  listMapSlots,
   listUploads,
   logout,
   resolveImageUrl,
@@ -13,6 +15,13 @@ import {
 import { BARRIER_BASE_HINT, DECORATE_BASE_HINT, type EditorMode, WorldEditor } from "./editor";
 
 const TRAY_ITEM_MIME = "application/x-item-url";
+const ALL_CATEGORY = "All";
+const RECENTLY_USED = "Recently Used";
+const RECENT_STORAGE_KEY = "bug-game-recent-decor";
+const RECENT_LIMIT = 20;
+const AUTOSAVE_SLOT = "autosave";
+const AUTOSAVE_INTERVAL_MS = 45_000;
+const DEFAULT_SLOT = "default";
 
 const MODES: { id: EditorMode; label: string }[] = [
   { id: "decorate", label: "Decorate" },
@@ -24,6 +33,7 @@ const topToolbar = document.getElementById("top-toolbar") as HTMLDivElement;
 const modeRow = document.getElementById("toolbox-row") as HTMLDivElement;
 const inspectPanel = document.getElementById("inspect-panel") as HTMLDivElement;
 const statusLine = document.getElementById("status-line") as HTMLDivElement;
+const categoryRow = document.getElementById("category-row") as HTMLDivElement;
 const trayRow = document.getElementById("tray-row") as HTMLDivElement;
 const addItemPanel = document.getElementById("add-item-panel") as HTMLDivElement;
 const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
@@ -34,8 +44,33 @@ const showBarriersToggle = document.getElementById("show-barriers-toggle") as HT
 const dropZone = document.getElementById("drop-zone") as HTMLDivElement;
 const fileInput = document.getElementById("file-input") as HTMLInputElement;
 const itemNameInput = document.getElementById("item-name") as HTMLInputElement;
+const itemCategoryInput = document.getElementById("item-category") as HTMLInputElement;
+const categoryOptionsList = document.getElementById("category-options") as HTMLDataListElement;
+const itemDefaultLayerSelect = document.getElementById("item-default-layer") as HTMLSelectElement;
 const uploadBtn = document.getElementById("upload-btn") as HTMLButtonElement;
 const uploadStatus = document.getElementById("upload-status") as HTMLDivElement;
+const slotModal = document.getElementById("slot-modal") as HTMLDivElement;
+const slotModalClose = document.getElementById("slot-modal-close") as HTMLButtonElement;
+const slotList = document.getElementById("slot-list") as HTMLDivElement;
+
+function getRecentlyUsedUrls(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordRecentlyUsed(url: string): void {
+  try {
+    const current = getRecentlyUsedUrls().filter((u) => u !== url);
+    current.unshift(url);
+    localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(current.slice(0, RECENT_LIMIT)));
+  } catch {
+    // Per-viewer convenience only — fine to silently no-op if storage is unavailable.
+  }
+}
 
 async function main(): Promise<void> {
   const params = new URLSearchParams(window.location.search);
@@ -85,6 +120,10 @@ function startEditor(): void {
   let libraryImages: UploadedImage[] = [];
   let pendingFile: File | null = null;
   let draggingImageUrl: string | null = null;
+  let activeCategory = ALL_CATEGORY;
+  let currentSlot = DEFAULT_SLOT;
+  let hasUnsavedChanges = false;
+  let hasChangesSinceAutosave = false;
 
   const setStatus = (message: string) => {
     statusLine.textContent = message;
@@ -103,11 +142,15 @@ function startEditor(): void {
       const redoBtn = document.getElementById("redo-btn") as HTMLButtonElement | null;
       if (undoBtn) undoBtn.disabled = !canUndo;
       if (redoBtn) redoBtn.disabled = !canRedo;
+      hasUnsavedChanges = true;
+      hasChangesSinceAutosave = true;
+      updateSlotLabel();
     },
     onModeChange: (mode) => {
       for (const btn of modeRow.querySelectorAll<HTMLButtonElement>("[data-mode]")) {
         btn.classList.toggle("active", btn.dataset.mode === mode);
       }
+      categoryRow.classList.toggle("hidden", mode !== "decorate");
       trayRow.classList.toggle("hidden", mode !== "decorate");
       addItemPanel.classList.toggle("hidden", mode !== "decorate");
       setStatus(mode === "barrier" ? BARRIER_BASE_HINT : DECORATE_BASE_HINT);
@@ -116,6 +159,12 @@ function startEditor(): void {
 
   engine.runRenderLoop(() => editor.render());
   window.addEventListener("resize", () => engine.resize());
+
+  window.addEventListener("beforeunload", (e) => {
+    if (!hasUnsavedChanges) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
 
   // Letter keys always pan the camera. Arrow keys pan too, unless something
   // is selected, in which case they nudge the selected item instead — the
@@ -161,7 +210,8 @@ function startEditor(): void {
     if (e.key === "Delete" || e.key === "Backspace") {
       editor.deleteInspected();
     } else if (e.key === "Escape") {
-      editor.deselect();
+      if (!slotModal.classList.contains("hidden")) closeSlotModal();
+      else editor.deselect();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && e.shiftKey) {
       editor.redo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
@@ -183,12 +233,14 @@ function startEditor(): void {
     editingEnabled = true;
     editor.setEditingEnabled(true);
     modeRow.classList.remove("hidden");
+    categoryRow.classList.remove("hidden");
     trayRow.classList.remove("hidden");
     addItemPanel.classList.remove("hidden");
     renderModeRow();
     renderTopToolbarEditMode();
     void refreshLibrary();
     setStatus(DECORATE_BASE_HINT);
+    window.setInterval(runAutosave, AUTOSAVE_INTERVAL_MS);
 
     // Showing the mode row/tray/add-item panel shrinks the canvas's CSS
     // size (it shares space with them via flexbox), but that's not a
@@ -197,6 +249,19 @@ function startEditor(): void {
     // resolution/aspect ratio while rendering just visually stretches to
     // fit. Force it explicitly.
     engine.resize();
+  }
+
+  async function runAutosave(): Promise<void> {
+    if (!hasChangesSinceAutosave) return;
+    hasChangesSinceAutosave = false;
+    try {
+      const thumbnail = await editor.captureThumbnail();
+      await saveMap(AUTOSAVE_SLOT, editor.exportMap(), thumbnail);
+      setStatus(`Autosaved draft (slot "${AUTOSAVE_SLOT}").`);
+    } catch {
+      // A missed autosave isn't worth interrupting the admin over; the next
+      // interval, or an explicit Save, will catch up.
+    }
   }
 
   function renderTopToolbarStart(): void {
@@ -208,8 +273,32 @@ function startEditor(): void {
     topToolbar.append(openBtn);
   }
 
+  function updateSlotLabel(): void {
+    const label = document.getElementById("slot-label");
+    if (label) label.textContent = `Slot: ${currentSlot}${hasUnsavedChanges ? " *" : ""}`;
+  }
+
+  async function saveCurrentSlot(): Promise<void> {
+    setStatus("Saving...");
+    try {
+      const thumbnail = await editor.captureThumbnail();
+      await saveMap(currentSlot, editor.exportMap(), thumbnail);
+      hasUnsavedChanges = false;
+      updateSlotLabel();
+      setStatus(`Saved to slot "${currentSlot}".`);
+    } catch (err) {
+      setStatus(`Save failed: ${(err as Error).message}`);
+    }
+  }
+
   function renderTopToolbarEditMode(): void {
     topToolbar.innerHTML = "";
+
+    const slotLabel = document.createElement("span");
+    slotLabel.id = "slot-label";
+    slotLabel.style.color = "#e6e6e6";
+    slotLabel.style.fontSize = "12px";
+    slotLabel.style.alignSelf = "center";
 
     const undoBtn = document.createElement("button");
     undoBtn.id = "undo-btn";
@@ -226,16 +315,24 @@ function startEditor(): void {
     redoBtn.onclick = () => editor.redo();
 
     const saveBtn = document.createElement("button");
-    saveBtn.textContent = "Save Edit";
-    saveBtn.onclick = async () => {
-      setStatus("Saving...");
-      try {
-        await saveMap(editor.exportMap());
-        setStatus("Saved.");
-      } catch (err) {
-        setStatus(`Save failed: ${(err as Error).message}`);
-      }
+    saveBtn.textContent = "Save";
+    saveBtn.onclick = () => void saveCurrentSlot();
+
+    const saveAsBtn = document.createElement("button");
+    saveAsBtn.textContent = "Save As...";
+    saveAsBtn.className = "secondary";
+    saveAsBtn.onclick = () => {
+      const name = window.prompt("Save as slot named:", currentSlot);
+      if (!name || !name.trim()) return;
+      currentSlot = name.trim();
+      updateSlotLabel();
+      void saveCurrentSlot();
     };
+
+    const loadBtn = document.createElement("button");
+    loadBtn.textContent = "Load...";
+    loadBtn.className = "secondary";
+    loadBtn.onclick = () => void openSlotModal();
 
     const logoutBtn = document.createElement("button");
     logoutBtn.textContent = "Log out";
@@ -245,8 +342,120 @@ function startEditor(): void {
       window.location.reload();
     };
 
-    topToolbar.append(undoBtn, redoBtn, saveBtn, logoutBtn);
+    topToolbar.append(slotLabel, undoBtn, redoBtn, saveBtn, saveAsBtn, loadBtn, logoutBtn);
+    updateSlotLabel();
   }
+
+  async function openSlotModal(): Promise<void> {
+    slotModal.classList.remove("hidden");
+    slotList.innerHTML = "Loading...";
+    let slots: MapSlotSummary[] = [];
+    try {
+      slots = await listMapSlots();
+    } catch (err) {
+      slotList.textContent = `Could not load save slots: ${(err as Error).message}`;
+      return;
+    }
+    renderSlotList(slots);
+  }
+
+  function closeSlotModal(): void {
+    slotModal.classList.add("hidden");
+  }
+
+  function renderSlotList(slots: MapSlotSummary[]): void {
+    slotList.innerHTML = "";
+
+    const newCard = document.createElement("div");
+    newCard.className = "slot-card new-slot";
+    newCard.textContent = "+ New map";
+    newCard.onclick = () => {
+      if (hasUnsavedChanges && !window.confirm(`Discard unsaved changes to "${currentSlot}" and start a new map?`)) return;
+      editor.loadMap({ decor: [], barriers: [] });
+      const name = window.prompt("Name the new map slot:", "");
+      currentSlot = name && name.trim() ? name.trim() : `untitled-${Date.now()}`;
+      hasUnsavedChanges = true;
+      updateSlotLabel();
+      closeSlotModal();
+      setStatus(`Started a new map. Slot "${currentSlot}" — Save to create it.`);
+    };
+    slotList.append(newCard);
+
+    for (const slot of slots) {
+      const card = document.createElement("div");
+      card.className = `slot-card${slot.mapId === currentSlot ? " current" : ""}`;
+
+      const thumb = document.createElement("img");
+      thumb.className = "slot-card-thumb";
+      thumb.src = slot.thumbnail ?? "";
+      thumb.alt = slot.mapId;
+
+      const body = document.createElement("div");
+      body.className = "slot-card-body";
+
+      const name = document.createElement("div");
+      name.className = "slot-card-name";
+      name.textContent = slot.mapId;
+
+      const meta = document.createElement("div");
+      meta.className = "slot-card-meta";
+      meta.textContent = new Date(slot.updatedAt).toLocaleString();
+
+      const actions = document.createElement("div");
+      actions.className = "slot-card-actions";
+
+      const loadBtn = document.createElement("button");
+      loadBtn.textContent = "Load";
+      loadBtn.onclick = (e) => {
+        e.stopPropagation();
+        void loadSlot(slot.mapId);
+      };
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.textContent = "Delete";
+      deleteBtn.className = "danger";
+      deleteBtn.onclick = (e) => {
+        e.stopPropagation();
+        void deleteSlot(slot.mapId);
+      };
+
+      actions.append(loadBtn, deleteBtn);
+      body.append(name, meta, actions);
+      card.append(thumb, body);
+      card.onclick = () => void loadSlot(slot.mapId);
+      slotList.append(card);
+    }
+  }
+
+  async function loadSlot(mapId: string): Promise<void> {
+    if (hasUnsavedChanges && !window.confirm(`Discard unsaved changes to "${currentSlot}" and load "${mapId}"?`)) return;
+    try {
+      const map = await getMap(mapId);
+      editor.loadMap(map);
+      currentSlot = mapId;
+      hasUnsavedChanges = false;
+      updateSlotLabel();
+      closeSlotModal();
+      setStatus(`Loaded slot "${mapId}": ${map.decor.length} decor, ${map.barriers.length} barriers.`);
+    } catch (err) {
+      setStatus(`Could not load slot "${mapId}": ${(err as Error).message}`);
+    }
+  }
+
+  async function deleteSlot(mapId: string): Promise<void> {
+    if (!window.confirm(`Permanently delete the "${mapId}" save slot? This can't be undone.`)) return;
+    try {
+      await deleteMapSlot(mapId);
+      await openSlotModal();
+    } catch (err) {
+      setStatus(`Could not delete slot "${mapId}": ${(err as Error).message}`);
+    }
+  }
+
+  slotModalClose.onclick = closeSlotModal;
+  slotModal.addEventListener("click", (e) => {
+    if (e.target === slotModal) closeSlotModal();
+  });
 
   function renderModeRow(): void {
     modeRow.innerHTML = "";
@@ -311,10 +520,7 @@ function startEditor(): void {
       };
 
       inspectPanel.classList.remove("hidden");
-      inspectPanel.append(
-        row(labelSpan("Width:"), widthInput),
-        row(labelSpan("Depth:"), depthInput)
-      );
+      inspectPanel.append(row(labelSpan("Width:"), widthInput), row(labelSpan("Depth:"), depthInput));
       return;
     }
 
@@ -380,21 +586,73 @@ function startEditor(): void {
     } catch {
       libraryImages = [];
     }
+    renderCategoryRow();
+    renderCategoryOptions();
     renderTray();
   };
 
-  function renderTray(): void {
+  function categoryOf(image: UploadedImage): string {
+    return image.category?.trim() || UNCATEGORIZED;
+  }
+
+  function renderCategoryRow(): void {
+    const categories = Array.from(new Set(libraryImages.map(categoryOf))).sort();
+    const tabs = [ALL_CATEGORY, RECENTLY_USED, ...categories];
+
+    if (!tabs.includes(activeCategory)) activeCategory = ALL_CATEGORY;
+
+    categoryRow.innerHTML = "";
+    for (const tab of tabs) {
+      const btn = document.createElement("button");
+      btn.textContent = tab;
+      btn.className = "secondary";
+      btn.classList.toggle("active", tab === activeCategory);
+      btn.onclick = () => {
+        activeCategory = tab;
+        renderCategoryRow();
+        renderTray();
+      };
+      categoryRow.append(btn);
+    }
+  }
+
+  function renderCategoryOptions(): void {
+    categoryOptionsList.innerHTML = "";
+    const categories = Array.from(new Set(libraryImages.map(categoryOf).filter((c) => c !== UNCATEGORIZED))).sort();
+    for (const category of categories) {
+      const option = document.createElement("option");
+      option.value = category;
+      categoryOptionsList.append(option);
+    }
+  }
+
+  function visibleTrayImages(): UploadedImage[] {
     const query = searchInput.value.trim().toLowerCase();
-    const filtered = query
-      ? libraryImages.filter((image) => image.originalName.toLowerCase().includes(query))
-      : libraryImages;
+    if (query) {
+      return libraryImages.filter((image) => image.originalName.toLowerCase().includes(query));
+    }
+    if (activeCategory === RECENTLY_USED) {
+      const recent = getRecentlyUsedUrls();
+      return recent.map((url) => libraryImages.find((i) => i.url === url)).filter((i): i is UploadedImage => !!i);
+    }
+    if (activeCategory === ALL_CATEGORY) return libraryImages;
+    return libraryImages.filter((image) => categoryOf(image) === activeCategory);
+  }
+
+  function renderTray(): void {
+    const filtered = visibleTrayImages();
 
     itemTray.innerHTML = "";
 
     if (filtered.length === 0) {
       const hint = document.createElement("div");
       hint.className = "empty-hint";
-      hint.textContent = libraryImages.length === 0 ? "No items yet — add one on the right." : "No matches.";
+      hint.textContent =
+        libraryImages.length === 0
+          ? "No items yet — add one on the right."
+          : activeCategory === RECENTLY_USED
+            ? "Nothing placed yet."
+            : "No matches.";
       itemTray.append(hint);
       return;
     }
@@ -416,6 +674,10 @@ function startEditor(): void {
       };
       itemTray.append(thumb);
     }
+  }
+
+  function findImage(url: string): UploadedImage | undefined {
+    return libraryImages.find((i) => i.url === url);
   }
 
   setupTrayScrolling();
@@ -487,7 +749,8 @@ function startEditor(): void {
 
       const trayUrl = e.dataTransfer?.getData(TRAY_ITEM_MIME);
       if (trayUrl) {
-        editor.placeDecorAt(screenX, screenY, trayUrl);
+        editor.placeDecorAt(screenX, screenY, trayUrl, findImage(trayUrl)?.defaultLayer);
+        recordRecentlyUsed(trayUrl);
         return;
       }
 
@@ -498,6 +761,7 @@ function startEditor(): void {
       uploadImage(file)
         .then(({ url }) => {
           editor.placeDecorAt(screenX, screenY, url);
+          recordRecentlyUsed(url);
           void refreshLibrary();
         })
         .catch((err: Error) => setStatus(`Upload failed: ${err.message}`));
@@ -532,7 +796,11 @@ function startEditor(): void {
       }
       uploadStatus.textContent = "Uploading...";
       try {
-        await uploadImage(pendingFile, itemNameInput.value.trim() || undefined);
+        await uploadImage(pendingFile, {
+          name: itemNameInput.value.trim() || undefined,
+          category: itemCategoryInput.value.trim() || undefined,
+          defaultLayer: itemDefaultLayerSelect.value as DecorLayer,
+        });
         uploadStatus.textContent = "Uploaded.";
         pendingFile = null;
         itemNameInput.value = "";
@@ -558,12 +826,18 @@ function startEditor(): void {
 
   renderTopToolbarStart();
 
-  getMap()
+  getMap(DEFAULT_SLOT)
     .then((map) => {
       editor.loadMap(map);
+      hasUnsavedChanges = false;
       setStatus(`Loaded map: ${map.decor.length} decor, ${map.barriers.length} barriers`);
     })
-    .catch((err: Error) => setStatus(`Could not load map: ${err.message}`));
+    .catch(() => {
+      // No "default" slot saved yet (fresh install) — start with a blank map.
+      editor.loadMap({ decor: [], barriers: [] });
+      hasUnsavedChanges = false;
+      setStatus('Starting a new map (slot "default").');
+    });
 }
 
 void main();

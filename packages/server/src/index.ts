@@ -18,7 +18,8 @@ configurePassport();
 const app = express();
 
 app.use(cors({ origin: config.clientUrl, credentials: true }));
-app.use(express.json());
+// Raised from the 100kb default: a map save includes a base64 thumbnail image.
+app.use(express.json({ limit: "2mb" }));
 app.use(
   session({
     secret: config.sessionSecret,

@@ -12,6 +12,7 @@ import {
   StandardMaterial,
   type SubMesh,
   Texture,
+  Tools,
   Vector3,
 } from "@babylonjs/core";
 import type { Barrier, DecorItem, DecorLayer, WorldMapData } from "@bug-game/shared";
@@ -30,6 +31,7 @@ const MIN_SCALE = 0.2;
 const MAX_SCALE = 6;
 const PAN_SPEED = 12; // world units per second
 const NUDGE_STEP = 0.1; // world units per arrow-key press
+const GRID_SIZE = 1; // world units; Shift-drag snaps to this grid
 const MIN_ORTHO_SIZE = 4;
 const MAX_ORTHO_SIZE = 40;
 const INITIAL_ORTHO_SIZE = 12;
@@ -176,6 +178,7 @@ export class WorldEditor {
   private dragMode: DragMode = "move";
   private resizeStart: ResizeStart | null = null;
   private isPanningCamera = false;
+  private shiftHeld = false;
   private panAnchorWorld: { x: number; z: number } | null = null;
   private ghostMesh: Mesh | null = null;
   private ghostImageUrl: string | null = null;
@@ -282,10 +285,15 @@ export class WorldEditor {
   }
 
   /** Places a decor item at the world position under canvas-relative screen coordinates (drag-and-drop from the palette). */
-  placeDecorAt(screenX: number, screenY: number, imageUrl: string): void {
+  placeDecorAt(screenX: number, screenY: number, imageUrl: string, defaultLayer?: DecorLayer): void {
     const point = this.pickGroundPointAt(screenX, screenY);
     if (!point) return;
-    this.placeDecor(point, imageUrl);
+    this.placeDecor(point, imageUrl, defaultLayer);
+  }
+
+  /** Renders the current view to a small data-URL thumbnail (for the map-slot picker), without disturbing the live render loop. */
+  captureThumbnail(): Promise<string> {
+    return Tools.CreateScreenshotAsync(this.engine, this.gameScene.camera, { width: 160, height: 90 });
   }
 
   /** Shows/updates a semi-transparent preview of the dragged palette item at the given canvas-relative screen position. */
@@ -470,7 +478,7 @@ export class WorldEditor {
     return mesh;
   }
 
-  private placeDecor(point: { x: number; z: number }, imageUrl: string): void {
+  private placeDecor(point: { x: number; z: number }, imageUrl: string, defaultLayer: DecorLayer = "auto"): void {
     const item: DecorItem = {
       id: crypto.randomUUID(),
       imageUrl,
@@ -478,7 +486,7 @@ export class WorldEditor {
       z: point.z,
       rotation: 0,
       scale: 1,
-      layer: "auto",
+      layer: defaultLayer,
     };
     this.decorItems.push(item);
     this.addDecorMesh(item);
@@ -741,6 +749,7 @@ export class WorldEditor {
     const { scene } = this.gameScene;
     scene.onPointerObservable.add((pointerInfo) => {
       if (!this.editingEnabled) return;
+      this.shiftHeld = (pointerInfo.event as PointerEvent | undefined)?.shiftKey ?? this.shiftHeld;
       if (pointerInfo.type === PointerEventTypes.POINTERDOWN) this.handlePointerDown();
       else if (pointerInfo.type === PointerEventTypes.POINTERMOVE) this.handlePointerMove();
       else if (pointerInfo.type === PointerEventTypes.POINTERUP) this.handlePointerUp();
@@ -888,6 +897,11 @@ export class WorldEditor {
       const id = this.draggingId;
 
       if (this.dragMode === "move") {
+        if (this.shiftHeld) {
+          point.x = Math.round(point.x / GRID_SIZE) * GRID_SIZE;
+          point.z = Math.round(point.z / GRID_SIZE) * GRID_SIZE;
+          this.setHint("Snapping to grid.");
+        }
         this.moveItem(id, kind, point);
       } else if (this.dragMode === "rotate") {
         const center = this.itemCenter(id, kind);

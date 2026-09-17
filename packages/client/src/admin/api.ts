@@ -1,4 +1,4 @@
-import type { AdminUser, UploadedImage, WorldMapData } from "@bug-game/shared";
+import type { AdminUser, DecorLayer, MapSlotSummary, UploadedImage, WorldMapData } from "@bug-game/shared";
 
 const SERVER_URL = "http://localhost:3001";
 
@@ -28,22 +28,35 @@ export function googleLoginUrl(): string {
   return `${SERVER_URL}/auth/google`;
 }
 
-export function getMap(): Promise<WorldMapData> {
-  return request("/admin/map");
+export function listMapSlots(): Promise<MapSlotSummary[]> {
+  return request("/admin/maps");
 }
 
-export function saveMap(data: WorldMapData): Promise<{ ok: true }> {
-  return request("/admin/map", {
+export function getMap(slot: string): Promise<WorldMapData> {
+  return request(`/admin/map/${encodeURIComponent(slot)}`);
+}
+
+export function saveMap(slot: string, data: WorldMapData, thumbnail: string | null): Promise<{ ok: true }> {
+  return request(`/admin/map/${encodeURIComponent(slot)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
+    body: JSON.stringify({ ...data, thumbnail }),
   });
 }
 
-export async function uploadImage(file: File, name?: string): Promise<{ url: string }> {
+export function deleteMapSlot(slot: string): Promise<{ ok: true }> {
+  return request(`/admin/map/${encodeURIComponent(slot)}`, { method: "DELETE" });
+}
+
+export async function uploadImage(
+  file: File,
+  options?: { name?: string; category?: string; defaultLayer?: DecorLayer }
+): Promise<{ url: string }> {
   const formData = new FormData();
   formData.append("image", file);
-  if (name) formData.append("name", name);
+  if (options?.name) formData.append("name", options.name);
+  if (options?.category) formData.append("category", options.category);
+  if (options?.defaultLayer) formData.append("defaultLayer", options.defaultLayer);
   return request("/admin/upload", { method: "POST", body: formData });
 }
 

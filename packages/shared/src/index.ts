@@ -36,10 +36,23 @@ export interface WorldMapData {
   barriers: Barrier[];
 }
 
+/** A named save slot's map data plus a thumbnail preview (mirrors Pony Town's `/savemap <slot>`). */
+export interface MapSlotSummary {
+  mapId: string;
+  updatedAt: string;
+  thumbnail: string | null;
+}
+
+export const UNCATEGORIZED = "Uncategorized";
+
 export interface UploadedImage {
   id: string;
   url: string;
   originalName: string;
+  /** Palette tab this item is filed under; falls back to UNCATEGORIZED when absent. */
+  category?: string;
+  /** Layer newly-placed instances of this item start on; falls back to "auto" when absent. */
+  defaultLayer?: DecorLayer;
 }
 
 export interface AdminUser {

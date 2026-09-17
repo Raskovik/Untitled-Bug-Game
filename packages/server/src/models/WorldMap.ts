@@ -28,16 +28,23 @@ const barrierSchema = new Schema<Barrier>(
   { _id: false }
 );
 
+/** `mapId` doubles as the save slot's name (mirrors Pony Town's `/savemap <slot>`). */
 interface WorldMapDocument {
   mapId: string;
   decor: DecorItem[];
   barriers: Barrier[];
+  thumbnail?: string;
+  updatedAt: Date;
 }
 
-const worldMapSchema = new Schema<WorldMapDocument>({
-  mapId: { type: String, required: true, unique: true },
-  decor: { type: [decorItemSchema], default: [] },
-  barriers: { type: [barrierSchema], default: [] },
-});
+const worldMapSchema = new Schema<WorldMapDocument>(
+  {
+    mapId: { type: String, required: true, unique: true },
+    decor: { type: [decorItemSchema], default: [] },
+    barriers: { type: [barrierSchema], default: [] },
+    thumbnail: { type: String },
+  },
+  { timestamps: { createdAt: false, updatedAt: true } }
+);
 
 export const WorldMap = model<WorldMapDocument>("WorldMap", worldMapSchema);
