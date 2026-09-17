@@ -81,26 +81,40 @@
         backdrop-filter: blur(4px);
       }
 
-      /* Floating toolbar over the selected item (Rotate/Resize/Delete) */
-      #selection-toolbar {
+      /* Panel for the currently-inspected item's Layer (fixed corner, not tracking the item on screen) */
+      #inspect-panel {
         position: absolute;
-        transform: translate(-50%, -130%);
+        top: 12px;
+        left: 12px;
         display: flex;
-        gap: 4px;
+        align-items: center;
+        gap: 6px;
         background: rgba(32, 34, 37, 0.9);
-        padding: 4px;
-        border-radius: 6px;
-        pointer-events: auto;
-        white-space: nowrap;
-      }
-      #selection-toolbar button {
         padding: 6px 8px;
+        border-radius: 6px;
+        white-space: nowrap;
         font-size: 12px;
+        color: #e6e6e6;
+      }
+
+      /* Toolbox row (Pony Town-style: one button per tool, always visible in edit mode) */
+      #toolbox-row {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        background: #202225;
+        border-top: 1px solid #14161a;
+      }
+      #toolbox-row button {
+        font-size: 12px;
+        padding: 8px 10px;
       }
 
       #tray-row {
         flex-shrink: 0;
-        height: 118px;
+        height: 100px;
         background: #202225;
         border-top: 1px solid #14161a;
         display: flex;
@@ -149,6 +163,9 @@
       }
       .tray-item:hover {
         border-color: #3c8dbc;
+      }
+      .tray-item.armed {
+        border-color: #f0c33c;
       }
 
       #add-item-panel {
@@ -254,9 +271,10 @@
           <canvas id="renderCanvas"></canvas>
           <div id="login-gate"></div>
           <div id="top-toolbar" class="hidden"></div>
-          <div id="selection-toolbar" class="hidden"></div>
+          <div id="inspect-panel" class="hidden"></div>
           <div id="status-line" class="hidden"></div>
         </div>
+        <div id="toolbox-row" class="hidden"></div>
         <div id="tray-row" class="hidden">
           <input id="search-items" type="text" placeholder="Search items" />
           <button id="add-btn" class="secondary">Add</button>

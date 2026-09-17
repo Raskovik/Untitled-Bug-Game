@@ -10,13 +10,25 @@ import {
   saveMap,
   uploadImage,
 } from "./api";
-import { WorldEditor } from "./editor";
+import { WorldEditor, type Tool } from "./editor";
 
 const TRAY_ITEM_MIME = "application/x-item-url";
 
+const TOOLS: { id: Tool; label: string; hint: string }[] = [
+  { id: "hammer", label: "Hammer", hint: "Pick an item below, then click the map to place it (repeatable)." },
+  { id: "crowbar", label: "Move", hint: "Click and drag an item to reposition it." },
+  { id: "rotate", label: "Rotate", hint: "Click and drag an item to spin it around its center." },
+  { id: "resize", label: "Resize", hint: "Click and drag an item outward or inward to scale it." },
+  { id: "wand", label: "Clone", hint: "Click an item to duplicate it." },
+  { id: "broom", label: "Delete", hint: "Click an item to remove it." },
+  { id: "barrier", label: "Barrier", hint: "Click and drag on the ground to draw a collision rectangle." },
+  { id: "inspect", label: "Inspect", hint: "Click an item to view/change its layer." },
+];
+
 const loginGate = document.getElementById("login-gate") as HTMLDivElement;
 const topToolbar = document.getElementById("top-toolbar") as HTMLDivElement;
-const selectionToolbar = document.getElementById("selection-toolbar") as HTMLDivElement;
+const toolboxRow = document.getElementById("toolbox-row") as HTMLDivElement;
+const inspectPanel = document.getElementById("inspect-panel") as HTMLDivElement;
 const statusLine = document.getElementById("status-line") as HTMLDivElement;
 const trayRow = document.getElementById("tray-row") as HTMLDivElement;
 const addItemPanel = document.getElementById("add-item-panel") as HTMLDivElement;
@@ -42,7 +54,7 @@ async function main(): Promise<void> {
   }
 
   loginGate.classList.add("hidden");
-  startEditor(user.email);
+  startEditor();
 }
 
 function renderLoginGate(error: string | null): void {
@@ -69,14 +81,15 @@ function renderLoginGate(error: string | null): void {
   loginGate.append(heading, message, button);
 }
 
-function startEditor(email: string): void {
+function startEditor(): void {
   const engine = new Engine(canvas, true);
 
-  let selectedItem: DecorItem | Barrier | null = null;
-  let selectedKind: "decor" | "barrier" | null = null;
+  let inspectedItem: DecorItem | Barrier | null = null;
+  let inspectedKind: "decor" | "barrier" | null = null;
   let editingEnabled = false;
   let libraryImages: UploadedImage[] = [];
   let pendingFile: File | null = null;
+  let armedImageUrl: string | null = null;
 
   const setStatus = (message: string) => {
     statusLine.textContent = message;
@@ -84,10 +97,10 @@ function startEditor(email: string): void {
   };
 
   const editor = new WorldEditor(engine, canvas, {
-    onSelectionChange: (item, kind) => {
-      selectedItem = item;
-      selectedKind = kind;
-      renderSelectionToolbar();
+    onInspect: (item, kind) => {
+      inspectedItem = item;
+      inspectedKind = kind;
+      renderInspectPanel();
     },
     onStatusChange: setStatus,
     onHistoryChange: (canUndo, canRedo) => {
@@ -96,47 +109,66 @@ function startEditor(email: string): void {
       if (undoBtn) undoBtn.disabled = !canUndo;
       if (redoBtn) redoBtn.disabled = !canRedo;
     },
+    onToolChange: (tool, nextArmedImageUrl) => {
+      armedImageUrl = nextArmedImageUrl;
+      for (const btn of toolboxRow.querySelectorAll<HTMLButtonElement>("[data-tool]")) {
+        btn.classList.toggle("active", btn.dataset.tool === tool);
+      }
+      const hint = TOOLS.find((t) => t.id === tool)?.hint ?? "";
+      setStatus(hint);
+      renderTray(armedImageUrl);
+    },
   });
 
-  engine.runRenderLoop(() => {
-    editor.render();
-    updateSelectionToolbarPosition();
-  });
+  engine.runRenderLoop(() => editor.render());
   window.addEventListener("resize", () => engine.resize());
+
+  const PAN_KEYS: Record<string, "up" | "down" | "left" | "right"> = {
+    w: "up",
+    arrowup: "up",
+    s: "down",
+    arrowdown: "down",
+    a: "left",
+    arrowleft: "left",
+    d: "right",
+    arrowright: "right",
+  };
 
   window.addEventListener("keydown", (e) => {
     if (!editingEnabled) return;
     const target = e.target as HTMLElement;
     if (target.tagName === "INPUT" || target.tagName === "SELECT") return;
 
-    if (e.shiftKey && e.key.startsWith("Arrow")) {
+    const direction = PAN_KEYS[e.key.toLowerCase()];
+    if (direction) {
       e.preventDefault();
-      const direction = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" } as const;
-      editor.panView(direction[e.key as keyof typeof direction]);
-    } else if (e.key === "Delete" || e.key === "Backspace") {
-      editor.deleteSelected();
+      editor.setPanKeyState(direction, true);
+      return;
+    }
+
+    if (e.key === "Delete" || e.key === "Backspace") {
+      editor.deleteInspected();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && e.shiftKey) {
       editor.redo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
       editor.undo();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
       editor.redo();
-    } else if (e.key === "Escape") {
-      setTool("select");
     }
   });
 
-  function setTool(tool: "select" | "barrier"): void {
-    editor.setTool(tool);
-    const barrierBtn = document.getElementById("barrier-tool-btn") as HTMLButtonElement | null;
-    if (barrierBtn) barrierBtn.classList.toggle("active", tool === "barrier");
-  }
+  window.addEventListener("keyup", (e) => {
+    const direction = PAN_KEYS[e.key.toLowerCase()];
+    if (direction) editor.setPanKeyState(direction, false);
+  });
 
   function enterEditMode(): void {
     editingEnabled = true;
     editor.setEditingEnabled(true);
+    toolboxRow.classList.remove("hidden");
     trayRow.classList.remove("hidden");
     addItemPanel.classList.remove("hidden");
+    renderToolboxRow();
     renderTopToolbarEditMode();
     void refreshLibrary();
   }
@@ -152,15 +184,6 @@ function startEditor(email: string): void {
 
   function renderTopToolbarEditMode(): void {
     topToolbar.innerHTML = "";
-
-    const barrierBtn = document.createElement("button");
-    barrierBtn.id = "barrier-tool-btn";
-    barrierBtn.textContent = "Draw Barrier";
-    barrierBtn.className = "secondary";
-    barrierBtn.onclick = () => {
-      const isActive = barrierBtn.classList.contains("active");
-      setTool(isActive ? "select" : "barrier");
-    };
 
     const undoBtn = document.createElement("button");
     undoBtn.id = "undo-btn";
@@ -196,71 +219,53 @@ function startEditor(email: string): void {
       window.location.reload();
     };
 
-    topToolbar.append(barrierBtn, undoBtn, redoBtn, saveBtn, logoutBtn);
+    topToolbar.append(undoBtn, redoBtn, saveBtn, logoutBtn);
   }
 
-  function renderSelectionToolbar(): void {
-    selectionToolbar.innerHTML = "";
-
-    if (!selectedItem || !selectedKind) {
-      selectionToolbar.classList.add("hidden");
-      return;
+  function renderToolboxRow(): void {
+    toolboxRow.innerHTML = "";
+    for (const tool of TOOLS) {
+      const btn = document.createElement("button");
+      btn.textContent = tool.label;
+      btn.className = "secondary";
+      btn.dataset.tool = tool.id;
+      btn.classList.toggle("active", tool.id === "crowbar");
+      btn.onclick = () => editor.setTool(tool.id);
+      toolboxRow.append(btn);
     }
-
-    const rotateBtn = document.createElement("button");
-    rotateBtn.textContent = "Rotate";
-    rotateBtn.className = "secondary";
-    rotateBtn.onclick = () => editor.beginRotate();
-
-    const resizeBtn = document.createElement("button");
-    resizeBtn.textContent = "Resize";
-    resizeBtn.className = "secondary";
-    resizeBtn.onclick = () => editor.beginResize();
-
-    const deleteBtn = document.createElement("button");
-    deleteBtn.textContent = "Delete";
-    deleteBtn.className = "danger";
-    deleteBtn.onclick = () => editor.deleteSelected();
-
-    selectionToolbar.append(rotateBtn, resizeBtn);
-
-    if (selectedKind === "decor") {
-      const item = selectedItem as DecorItem;
-      const layerSelect = document.createElement("select");
-      for (const [value, label] of [
-        ["behind", "Behind"],
-        ["auto", "Auto"],
-        ["front", "Front"],
-      ] as const) {
-        const option = document.createElement("option");
-        option.value = value;
-        option.textContent = label;
-        option.selected = item.layer === value;
-        layerSelect.append(option);
-      }
-      layerSelect.onchange = () => {
-        editor.updateSelected({ layer: layerSelect.value as DecorItem["layer"] });
-        editor.commitHistory();
-      };
-      selectionToolbar.append(layerSelect);
-    }
-
-    selectionToolbar.append(deleteBtn);
   }
 
-  function updateSelectionToolbarPosition(): void {
-    if (!editingEnabled) {
-      selectionToolbar.classList.add("hidden");
+  function renderInspectPanel(): void {
+    inspectPanel.innerHTML = "";
+
+    if (!inspectedItem || inspectedKind !== "decor") {
+      inspectPanel.classList.add("hidden");
       return;
     }
-    const pos = editor.getSelectedScreenPosition();
-    if (!pos) {
-      selectionToolbar.classList.add("hidden");
-      return;
+
+    const item = inspectedItem as DecorItem;
+    const label = document.createElement("span");
+    label.textContent = "Layer:";
+
+    const layerSelect = document.createElement("select");
+    for (const [value, text] of [
+      ["behind", "Behind"],
+      ["auto", "Auto"],
+      ["front", "Front"],
+    ] as const) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      option.selected = item.layer === value;
+      layerSelect.append(option);
     }
-    selectionToolbar.classList.remove("hidden");
-    selectionToolbar.style.left = `${pos.x}px`;
-    selectionToolbar.style.top = `${pos.y}px`;
+    layerSelect.onchange = () => {
+      editor.updateInspected({ layer: layerSelect.value as DecorItem["layer"] });
+      editor.commitHistory();
+    };
+
+    inspectPanel.classList.remove("hidden");
+    inspectPanel.append(label, layerSelect);
   }
 
   const refreshLibrary = async () => {
@@ -269,10 +274,10 @@ function startEditor(email: string): void {
     } catch {
       libraryImages = [];
     }
-    renderTray();
+    renderTray(armedImageUrl);
   };
 
-  function renderTray(): void {
+  function renderTray(armedImageUrl: string | null): void {
     const query = searchInput.value.trim().toLowerCase();
     const filtered = query
       ? libraryImages.filter((image) => image.originalName.toLowerCase().includes(query))
@@ -293,10 +298,15 @@ function startEditor(email: string): void {
       thumb.src = resolveImageUrl(image.url);
       thumb.title = image.originalName;
       thumb.className = "tray-item";
+      thumb.classList.toggle("armed", image.url === armedImageUrl);
       thumb.draggable = true;
       thumb.ondragstart = (e) => {
         e.dataTransfer?.setData(TRAY_ITEM_MIME, image.url);
         if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+      };
+      thumb.onclick = () => {
+        editor.armHammer(image.url);
+        setStatus(`Hammer holding "${image.originalName}" — click the map to place it.`);
       };
       itemTray.append(thumb);
     }
@@ -306,7 +316,7 @@ function startEditor(email: string): void {
   setupDropZone();
   setupCanvasDrop();
 
-  searchInput.oninput = () => renderTray();
+  searchInput.oninput = () => renderTray(armedImageUrl);
 
   addBtn.onclick = () => fileInput.click();
 
@@ -316,8 +326,6 @@ function startEditor(email: string): void {
     let startScroll = 0;
 
     itemTray.addEventListener("mousedown", (e) => {
-      // Only scroll-drag when grabbing empty tray space — dragging a thumbnail
-      // itself is a native HTML5 drag (placement), handled separately.
       if ((e.target as HTMLElement).classList.contains("tray-item")) return;
       dragging = true;
       startX = e.pageX;
@@ -342,6 +350,39 @@ function startEditor(email: string): void {
       },
       { passive: false }
     );
+  }
+
+  function setupCanvasDrop(): void {
+    canvas.addEventListener("dragover", (e) => {
+      if (!editingEnabled) return;
+      e.preventDefault();
+    });
+
+    canvas.addEventListener("drop", (e) => {
+      if (!editingEnabled) return;
+      e.preventDefault();
+
+      const rect = canvas.getBoundingClientRect();
+      const screenX = e.clientX - rect.left;
+      const screenY = e.clientY - rect.top;
+
+      const trayUrl = e.dataTransfer?.getData(TRAY_ITEM_MIME);
+      if (trayUrl) {
+        editor.placeDecorAt(screenX, screenY, trayUrl);
+        return;
+      }
+
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) return;
+
+      setStatus("Uploading...");
+      uploadImage(file)
+        .then(({ url }) => {
+          editor.placeDecorAt(screenX, screenY, url);
+          void refreshLibrary();
+        })
+        .catch((err: Error) => setStatus(`Upload failed: ${err.message}`));
+    });
   }
 
   function setupDropZone(): void {
@@ -383,39 +424,6 @@ function startEditor(email: string): void {
         uploadStatus.textContent = `Upload failed: ${(err as Error).message}`;
       }
     };
-  }
-
-  function setupCanvasDrop(): void {
-    canvas.addEventListener("dragover", (e) => {
-      if (!editingEnabled) return;
-      e.preventDefault();
-    });
-
-    canvas.addEventListener("drop", (e) => {
-      if (!editingEnabled) return;
-      e.preventDefault();
-
-      const rect = canvas.getBoundingClientRect();
-      const screenX = e.clientX - rect.left;
-      const screenY = e.clientY - rect.top;
-
-      const trayUrl = e.dataTransfer?.getData(TRAY_ITEM_MIME);
-      if (trayUrl) {
-        editor.placeDecor(screenX, screenY, trayUrl);
-        return;
-      }
-
-      const file = e.dataTransfer?.files?.[0];
-      if (!file) return;
-
-      setStatus("Uploading...");
-      uploadImage(file)
-        .then(({ url }) => {
-          editor.placeDecor(screenX, screenY, url);
-          void refreshLibrary();
-        })
-        .catch((err: Error) => setStatus(`Upload failed: ${err.message}`));
-    });
   }
 
   function setPendingFile(file: File): void {

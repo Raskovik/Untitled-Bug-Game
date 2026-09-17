@@ -35,6 +35,7 @@ export interface GameScene {
   scene: Scene;
   camera: ArcRotateCamera;
   ground: Mesh;
+  setOrthoSize: (size: number) => void;
 }
 
 export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScene {
@@ -59,14 +60,20 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScen
   camera.inputs.clear();
   camera.mode = Camera.ORTHOGRAPHIC_CAMERA;
 
+  let orthoSize = ORTHO_SIZE;
   const updateOrthoBounds = () => {
     const aspect = engine.getRenderWidth() / engine.getRenderHeight();
-    camera.orthoTop = ORTHO_SIZE;
-    camera.orthoBottom = -ORTHO_SIZE;
-    camera.orthoLeft = -ORTHO_SIZE * aspect;
-    camera.orthoRight = ORTHO_SIZE * aspect;
+    camera.orthoTop = orthoSize;
+    camera.orthoBottom = -orthoSize;
+    camera.orthoLeft = -orthoSize * aspect;
+    camera.orthoRight = orthoSize * aspect;
   };
   updateOrthoBounds();
+
+  const setOrthoSize = (size: number) => {
+    orthoSize = size;
+    updateOrthoBounds();
+  };
 
   const light = new HemisphericLight("mainLight", new Vector3(0, 1, 0), scene);
   light.intensity = 0.9;
@@ -79,7 +86,7 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScen
     updateOrthoBounds();
   });
 
-  return { scene, camera, ground };
+  return { scene, camera, ground, setOrthoSize };
 }
 
 function createGroundMaterial(scene: Scene) {

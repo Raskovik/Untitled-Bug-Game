@@ -22,17 +22,27 @@ const HISTORY_LIMIT = 100;
 const HOVER_GLOW_COLOR = new Color3(1, 0.9, 0.3);
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 6;
-const KEY_PAN_STEP = 3;
+const PAN_SPEED = 12; // world units per second
+const MIN_ORTHO_SIZE = 4;
+const MAX_ORTHO_SIZE = 40;
+const INITIAL_ORTHO_SIZE = 12;
 
-type Tool = "select" | "barrier";
+/**
+ * A Pony Town-style toolbox: each tool does exactly one job, chosen
+ * explicitly before acting on the map (hammer=place, crowbar=move,
+ * wand=duplicate, broom=delete) rather than a generic "select" tool with
+ * contextual buttons.
+ */
+export type Tool = "hammer" | "crowbar" | "rotate" | "resize" | "wand" | "broom" | "barrier" | "inspect";
 type SelectionKind = "decor" | "barrier" | null;
 type DragMode = "move" | "rotate" | "resize";
-type PanDirection = "up" | "down" | "left" | "right";
+export type PanDirection = "up" | "down" | "left" | "right";
 
 export interface EditorCallbacks {
-  onSelectionChange: (item: DecorItem | Barrier | null, kind: SelectionKind) => void;
+  onInspect: (item: DecorItem | Barrier | null, kind: SelectionKind) => void;
   onStatusChange: (message: string) => void;
   onHistoryChange: (canUndo: boolean, canRedo: boolean) => void;
+  onToolChange: (tool: Tool, armedImageUrl: string | null) => void;
 }
 
 interface ResizeStart {
@@ -48,22 +58,24 @@ export class WorldEditor {
   private barrierMeshes = new Map<string, Mesh>();
   private decorItems: DecorItem[] = [];
   private barriers: Barrier[] = [];
-  private tool: Tool = "select";
-  private selectedId: string | null = null;
-  private selectedKind: SelectionKind = null;
+  private tool: Tool = "crowbar";
+  private armedImageUrl: string | null = null;
+  private inspectedId: string | null = null;
+  private inspectedKind: SelectionKind = null;
   private drawStart: { x: number; z: number } | null = null;
   private drawPreview: Mesh | null = null;
   private draggingId: string | null = null;
+  private draggingKind: SelectionKind = null;
   private draggedDuringGesture = false;
   private dragMode: DragMode = "move";
-  private pendingInteraction: "rotate" | "resize" | null = null;
   private resizeStart: ResizeStart | null = null;
   private history: WorldMapData[] = [];
   private historyIndex = -1;
   private editingEnabled = false;
   private highlightLayer: HighlightLayer;
   private hoveredId: string | null = null;
-  private panLastScreen: { x: number; y: number } | null = null;
+  private heldPanDirections = new Set<PanDirection>();
+  private orthoSize = INITIAL_ORTHO_SIZE;
 
   constructor(
     private engine: Engine,
@@ -73,6 +85,16 @@ export class WorldEditor {
     this.gameScene = createScene(engine, canvas);
     this.highlightLayer = new HighlightLayer("hoverHighlight", this.gameScene.scene);
     this.setupPointerHandling();
+
+    canvas.addEventListener(
+      "wheel",
+      (e) => {
+        if (!this.editingEnabled) return;
+        e.preventDefault();
+        this.zoomBy(e.deltaY);
+      },
+      { passive: false }
+    );
   }
 
   get scene() {
@@ -80,14 +102,16 @@ export class WorldEditor {
   }
 
   render(): void {
+    this.applyContinuousPan();
     this.gameScene.scene.render();
   }
 
   setEditingEnabled(enabled: boolean): void {
     this.editingEnabled = enabled;
     if (!enabled) {
-      this.clearSelection();
+      this.clearInspection();
       this.clearHover();
+      this.heldPanDirections.clear();
     }
   }
 
@@ -102,168 +126,67 @@ export class WorldEditor {
     return { decor: this.decorItems, barriers: this.barriers };
   }
 
+  get activeTool(): Tool {
+    return this.tool;
+  }
+
   setTool(tool: Tool): void {
     this.tool = tool;
-    this.clearSelection();
+    if (tool !== "hammer") this.armedImageUrl = null;
+    this.clearInspection();
+    this.callbacks.onToolChange(this.tool, this.armedImageUrl);
   }
 
-  /**
-   * Places a decor item at the world position under the given canvas-relative
-   * screen coordinates (used by drag-and-drop from the tray or the OS), and
-   * selects it so the floating toolbar appears immediately.
-   */
-  placeDecor(screenX: number, screenY: number, imageUrl: string): void {
+  /** Selects an image to place and switches to the hammer tool (repeatable placement, like Pony Town). */
+  armHammer(imageUrl: string): void {
+    this.tool = "hammer";
+    this.armedImageUrl = imageUrl;
+    this.clearInspection();
+    this.callbacks.onToolChange(this.tool, this.armedImageUrl);
+  }
+
+  /** Places a decor item at the world position under canvas-relative screen coordinates (drag-and-drop from tray/OS). */
+  placeDecorAt(screenX: number, screenY: number, imageUrl: string): void {
     const point = this.pickGroundPointAt(screenX, screenY);
     if (!point) return;
-
-    const item: DecorItem = {
-      id: crypto.randomUUID(),
-      imageUrl,
-      x: point.x,
-      z: point.z,
-      rotation: 0,
-      scale: 1,
-      layer: "auto",
-    };
-    this.decorItems.push(item);
-    this.addDecorMesh(item);
-    this.tool = "select";
-    this.selectedId = item.id;
-    this.selectedKind = "decor";
-    this.callbacks.onSelectionChange(item, "decor");
-    this.callbacks.onStatusChange(`Placed decor at (${point.x.toFixed(1)}, ${point.z.toFixed(1)})`);
-    this.pushHistory();
+    this.placeDecor(point, imageUrl);
   }
 
-  /** Arms a one-shot rotate gesture: the next canvas drag rotates the selected item. */
-  beginRotate(): void {
-    if (!this.selectedId) return;
-    this.pendingInteraction = "rotate";
+  /** Deletes whatever is currently inspected, if anything (keyboard-shortcut convenience for the inspect tool). */
+  deleteInspected(): void {
+    if (!this.inspectedId) return;
+    this.deleteItem(this.inspectedId, this.inspectedKind);
   }
 
-  /** Arms a one-shot resize gesture: the next canvas drag resizes the selected item. */
-  beginResize(): void {
-    if (!this.selectedId) return;
-    this.pendingInteraction = "resize";
+  /** Pan the camera continuously while a direction key is held (WASD/arrows), like Pony Town's movement keys. */
+  setPanKeyState(direction: PanDirection, pressed: boolean): void {
+    if (pressed) this.heldPanDirections.add(direction);
+    else this.heldPanDirections.delete(direction);
   }
 
-  /** Screen-space position (px) of the current selection, for positioning a floating toolbar. Null if nothing selected. */
-  getSelectedScreenPosition(): { x: number; y: number } | null {
-    if (!this.selectedId) return null;
-    const mesh = this.decorMeshes.get(this.selectedId) ?? this.barrierMeshes.get(this.selectedId);
-    if (!mesh) return null;
-
-    const { scene, camera } = this.gameScene;
-    const viewport = camera.viewport.toGlobal(this.engine.getRenderWidth(), this.engine.getRenderHeight());
-    const projected = Vector3.Project(
-      mesh.getAbsolutePosition(),
-      Matrix.Identity(),
-      scene.getTransformMatrix(),
-      viewport
-    );
-    return { x: projected.x, y: projected.y };
+  zoomBy(wheelDeltaY: number): void {
+    const factor = Math.exp(wheelDeltaY * 0.001);
+    this.orthoSize = clamp(this.orthoSize * factor, MIN_ORTHO_SIZE, MAX_ORTHO_SIZE);
+    this.gameScene.setOrthoSize(this.orthoSize);
   }
 
-  /** Pans the camera one fixed step in the given screen-relative direction (for keyboard shortcuts). */
-  panView(direction: PanDirection): void {
-    const { right, forward } = this.groundPanAxes();
-    const stepVector: Record<PanDirection, Vector3> = {
-      up: forward.scale(KEY_PAN_STEP),
-      down: forward.scale(-KEY_PAN_STEP),
-      left: right.scale(-KEY_PAN_STEP),
-      right: right.scale(KEY_PAN_STEP),
-    };
-    this.gameScene.camera.target.addInPlace(stepVector[direction]);
-  }
+  updateInspected(patch: Partial<DecorItem> | Partial<Barrier>): void {
+    if (!this.inspectedId) return;
 
-  /**
-   * The camera's right/"up on screen" directions, flattened onto the ground
-   * plane (Y zeroed out) so panning always slides across the flat map —
-   * like sliding a sheet of paper — instead of drifting off the fixed
-   * viewing angle the way the raw camera-space vectors would.
-   */
-  private groundPanAxes(): { right: Vector3; forward: Vector3 } {
-    const { camera } = this.gameScene;
-    const rawRight = camera.getDirection(Vector3.Right());
-    const rawUp = camera.getDirection(Vector3.Up());
-    const right = new Vector3(rawRight.x, 0, rawRight.z).normalize();
-    const forward = new Vector3(rawUp.x, 0, rawUp.z).normalize();
-    return { right, forward };
-  }
-
-  updateSelected(patch: Partial<DecorItem> | Partial<Barrier>): void {
-    if (!this.selectedId) return;
-
-    if (this.selectedKind === "decor") {
-      const item = this.decorItems.find((d) => d.id === this.selectedId);
+    if (this.inspectedKind === "decor") {
+      const item = this.decorItems.find((d) => d.id === this.inspectedId);
       if (!item) return;
       Object.assign(item, patch);
       this.refreshDecorMesh(item);
-    } else if (this.selectedKind === "barrier") {
-      const barrier = this.barriers.find((b) => b.id === this.selectedId);
+    } else if (this.inspectedKind === "barrier") {
+      const barrier = this.barriers.find((b) => b.id === this.inspectedId);
       if (!barrier) return;
       Object.assign(barrier, patch);
       this.refreshBarrierMesh(barrier);
     }
   }
 
-  /** Call after a batch of updateSelected() calls (e.g. a slider drag ends) to make it undoable. */
   commitHistory(): void {
-    this.pushHistory();
-  }
-
-  duplicateSelected(): void {
-    if (!this.selectedId) return;
-
-    if (this.selectedKind === "decor") {
-      const source = this.decorItems.find((d) => d.id === this.selectedId);
-      if (!source) return;
-      const clone: DecorItem = {
-        ...source,
-        id: crypto.randomUUID(),
-        x: source.x + DUPLICATE_OFFSET,
-        z: source.z + DUPLICATE_OFFSET,
-      };
-      this.decorItems.push(clone);
-      this.addDecorMesh(clone);
-      this.selectedId = clone.id;
-      this.callbacks.onSelectionChange(clone, "decor");
-      this.pushHistory();
-      this.callbacks.onStatusChange("Duplicated");
-    } else if (this.selectedKind === "barrier") {
-      const source = this.barriers.find((b) => b.id === this.selectedId);
-      if (!source) return;
-      const clone: Barrier = {
-        ...source,
-        id: crypto.randomUUID(),
-        x: source.x + DUPLICATE_OFFSET,
-        z: source.z + DUPLICATE_OFFSET,
-      };
-      this.barriers.push(clone);
-      this.addBarrierMesh(clone);
-      this.selectedId = clone.id;
-      this.callbacks.onSelectionChange(clone, "barrier");
-      this.pushHistory();
-      this.callbacks.onStatusChange("Duplicated");
-    }
-  }
-
-  deleteSelected(): void {
-    if (!this.selectedId) return;
-
-    if (this.hoveredId === this.selectedId) this.clearHover();
-
-    if (this.selectedKind === "decor") {
-      this.decorMeshes.get(this.selectedId)?.dispose();
-      this.decorMeshes.delete(this.selectedId);
-      this.decorItems = this.decorItems.filter((d) => d.id !== this.selectedId);
-    } else if (this.selectedKind === "barrier") {
-      this.barrierMeshes.get(this.selectedId)?.dispose();
-      this.barrierMeshes.delete(this.selectedId);
-      this.barriers = this.barriers.filter((b) => b.id !== this.selectedId);
-    }
-
-    this.clearSelection();
     this.pushHistory();
   }
 
@@ -281,6 +204,59 @@ export class WorldEditor {
     this.notifyHistoryChange();
   }
 
+  private placeDecor(point: { x: number; z: number }, imageUrl: string): void {
+    const item: DecorItem = {
+      id: crypto.randomUUID(),
+      imageUrl,
+      x: point.x,
+      z: point.z,
+      rotation: 0,
+      scale: 1,
+      layer: "auto",
+    };
+    this.decorItems.push(item);
+    this.addDecorMesh(item);
+    this.callbacks.onStatusChange(`Placed decor at (${point.x.toFixed(1)}, ${point.z.toFixed(1)})`);
+    this.pushHistory();
+  }
+
+  private duplicate(id: string, kind: SelectionKind): void {
+    if (kind === "decor") {
+      const source = this.decorItems.find((d) => d.id === id);
+      if (!source) return;
+      const clone: DecorItem = { ...source, id: crypto.randomUUID(), x: source.x + DUPLICATE_OFFSET, z: source.z + DUPLICATE_OFFSET };
+      this.decorItems.push(clone);
+      this.addDecorMesh(clone);
+      this.callbacks.onStatusChange("Duplicated");
+      this.pushHistory();
+    } else if (kind === "barrier") {
+      const source = this.barriers.find((b) => b.id === id);
+      if (!source) return;
+      const clone: Barrier = { ...source, id: crypto.randomUUID(), x: source.x + DUPLICATE_OFFSET, z: source.z + DUPLICATE_OFFSET };
+      this.barriers.push(clone);
+      this.addBarrierMesh(clone);
+      this.callbacks.onStatusChange("Duplicated");
+      this.pushHistory();
+    }
+  }
+
+  private deleteItem(id: string, kind: SelectionKind): void {
+    if (this.hoveredId === id) this.clearHover();
+    if (this.inspectedId === id) this.clearInspection();
+
+    if (kind === "decor") {
+      this.decorMeshes.get(id)?.dispose();
+      this.decorMeshes.delete(id);
+      this.decorItems = this.decorItems.filter((d) => d.id !== id);
+    } else if (kind === "barrier") {
+      this.barrierMeshes.get(id)?.dispose();
+      this.barrierMeshes.delete(id);
+      this.barriers = this.barriers.filter((b) => b.id !== id);
+    }
+    this.callbacks.onStatusChange("Deleted");
+    this.pushHistory();
+  }
+
   private snapshot(): WorldMapData {
     return {
       decor: this.decorItems.map((item) => ({ ...item })),
@@ -291,9 +267,7 @@ export class WorldEditor {
   private pushHistory(): void {
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push(this.snapshot());
-    if (this.history.length > HISTORY_LIMIT) {
-      this.history.shift();
-    }
+    if (this.history.length > HISTORY_LIMIT) this.history.shift();
     this.historyIndex = this.history.length - 1;
     this.notifyHistoryChange();
   }
@@ -315,14 +289,13 @@ export class WorldEditor {
     for (const item of this.decorItems) this.addDecorMesh(item);
     for (const barrier of this.barriers) this.addBarrierMesh(barrier);
 
-    this.clearSelection();
+    this.clearInspection();
   }
 
-  private clearSelection(): void {
-    this.selectedId = null;
-    this.selectedKind = null;
-    this.pendingInteraction = null;
-    this.callbacks.onSelectionChange(null, null);
+  private clearInspection(): void {
+    this.inspectedId = null;
+    this.inspectedKind = null;
+    this.callbacks.onInspect(null, null);
   }
 
   private clearHover(): void {
@@ -335,10 +308,8 @@ export class WorldEditor {
   private updateHover(): void {
     const mesh = this.pickAnyMesh();
     const id = (mesh?.metadata?.decorId as string | undefined) ?? (mesh?.metadata?.barrierId as string | undefined) ?? null;
-
     if (id === this.hoveredId) return;
     this.clearHover();
-
     if (id) {
       const newMesh = this.decorMeshes.get(id) ?? this.barrierMeshes.get(id);
       if (newMesh) {
@@ -350,17 +321,11 @@ export class WorldEditor {
 
   private setupPointerHandling(): void {
     const { scene } = this.gameScene;
-
     scene.onPointerObservable.add((pointerInfo) => {
       if (!this.editingEnabled) return;
-
-      if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
-        this.handlePointerDown(Boolean(pointerInfo.event.shiftKey));
-      } else if (pointerInfo.type === PointerEventTypes.POINTERMOVE) {
-        this.handlePointerMove();
-      } else if (pointerInfo.type === PointerEventTypes.POINTERUP) {
-        this.handlePointerUp();
-      }
+      if (pointerInfo.type === PointerEventTypes.POINTERDOWN) this.handlePointerDown();
+      else if (pointerInfo.type === PointerEventTypes.POINTERMOVE) this.handlePointerMove();
+      else if (pointerInfo.type === PointerEventTypes.POINTERUP) this.handlePointerUp();
     });
   }
 
@@ -375,12 +340,18 @@ export class WorldEditor {
   }
 
   private pickAnyMesh(): Mesh | null {
-    const pick = this.gameScene.scene.pick(
-      this.gameScene.scene.pointerX,
-      this.gameScene.scene.pointerY
-    );
+    const pick = this.gameScene.scene.pick(this.gameScene.scene.pointerX, this.gameScene.scene.pointerY);
     if (!pick?.hit || !pick.pickedMesh) return null;
     return pick.pickedMesh as Mesh;
+  }
+
+  private pickItem(): { id: string; kind: SelectionKind } | null {
+    const mesh = this.pickAnyMesh();
+    const decorId = mesh?.metadata?.decorId as string | undefined;
+    const barrierId = mesh?.metadata?.barrierId as string | undefined;
+    if (decorId) return { id: decorId, kind: "decor" };
+    if (barrierId) return { id: barrierId, kind: "barrier" };
+    return null;
   }
 
   private itemCenter(id: string, kind: SelectionKind): { x: number; z: number } | null {
@@ -395,33 +366,12 @@ export class WorldEditor {
     return null;
   }
 
-  private handlePointerDown(shiftKey: boolean): void {
-    if (shiftKey) {
-      this.panLastScreen = { x: this.gameScene.scene.pointerX, y: this.gameScene.scene.pointerY };
-      return;
-    }
-
-    if (this.pendingInteraction && this.selectedId) {
-      const center = this.itemCenter(this.selectedId, this.selectedKind);
+  private handlePointerDown(): void {
+    if (this.tool === "hammer") {
+      if (!this.armedImageUrl) return;
       const point = this.pickGroundPoint();
-      if (!center || !point) return;
-
-      this.draggingId = this.selectedId;
-      this.draggedDuringGesture = false;
-      this.dragMode = this.pendingInteraction;
-
-      if (this.pendingInteraction === "resize") {
-        const distance = Math.hypot(point.x - center.x, point.z - center.z) || 0.01;
-        if (this.selectedKind === "decor") {
-          const item = this.decorItems.find((d) => d.id === this.selectedId);
-          this.resizeStart = { distance, decorScale: item?.scale ?? 1 };
-        } else {
-          const barrier = this.barriers.find((b) => b.id === this.selectedId);
-          this.resizeStart = { distance, barrierWidth: barrier?.width ?? 1, barrierDepth: barrier?.depth ?? 1 };
-        }
-      }
-
-      this.pendingInteraction = null;
+      if (!point) return;
+      this.placeDecor(point, this.armedImageUrl);
       return;
     }
 
@@ -432,73 +382,81 @@ export class WorldEditor {
       return;
     }
 
-    // select tool
-    const mesh = this.pickAnyMesh();
-    if (!mesh) {
-      this.clearSelection();
+    const picked = this.pickItem();
+
+    if (this.tool === "wand") {
+      if (picked) this.duplicate(picked.id, picked.kind);
       return;
     }
 
-    const decorId = mesh.metadata?.decorId as string | undefined;
-    const barrierId = mesh.metadata?.barrierId as string | undefined;
+    if (this.tool === "broom") {
+      if (picked) this.deleteItem(picked.id, picked.kind);
+      return;
+    }
 
-    if (decorId) {
-      this.selectedId = decorId;
-      this.selectedKind = "decor";
-      this.draggingId = decorId;
-      this.draggedDuringGesture = false;
-      this.dragMode = "move";
-      const item = this.decorItems.find((d) => d.id === decorId) ?? null;
-      this.callbacks.onSelectionChange(item, "decor");
-    } else if (barrierId) {
-      this.selectedId = barrierId;
-      this.selectedKind = "barrier";
-      this.draggingId = barrierId;
-      this.draggedDuringGesture = false;
-      this.dragMode = "move";
-      const barrier = this.barriers.find((b) => b.id === barrierId) ?? null;
-      this.callbacks.onSelectionChange(barrier, "barrier");
-    } else {
-      this.clearSelection();
+    if (this.tool === "inspect") {
+      if (picked) {
+        this.inspectedId = picked.id;
+        this.inspectedKind = picked.kind;
+        const item =
+          picked.kind === "decor"
+            ? (this.decorItems.find((d) => d.id === picked.id) ?? null)
+            : (this.barriers.find((b) => b.id === picked.id) ?? null);
+        this.callbacks.onInspect(item, picked.kind);
+      } else {
+        this.clearInspection();
+      }
+      return;
+    }
+
+    // crowbar / rotate / resize all start a drag on whatever was clicked.
+    if (!picked) return;
+
+    this.draggingId = picked.id;
+    this.draggingKind = picked.kind;
+    this.draggedDuringGesture = false;
+    this.dragMode = this.tool === "rotate" ? "rotate" : this.tool === "resize" ? "resize" : "move";
+
+    if (this.dragMode === "resize") {
+      const center = this.itemCenter(picked.id, picked.kind);
+      const point = this.pickGroundPoint();
+      if (center && point) {
+        const distance = Math.hypot(point.x - center.x, point.z - center.z) || 0.01;
+        if (picked.kind === "decor") {
+          const item = this.decorItems.find((d) => d.id === picked.id);
+          this.resizeStart = { distance, decorScale: item?.scale ?? 1 };
+        } else {
+          const barrier = this.barriers.find((b) => b.id === picked.id);
+          this.resizeStart = { distance, barrierWidth: barrier?.width ?? 1, barrierDepth: barrier?.depth ?? 1 };
+        }
+      }
     }
   }
 
   private handlePointerMove(): void {
-    if (this.panLastScreen) {
-      const { scene } = this.gameScene;
-      const dxScreen = scene.pointerX - this.panLastScreen.x;
-      const dyScreen = scene.pointerY - this.panLastScreen.y;
-      this.applyScreenPan(dxScreen, dyScreen);
-      this.panLastScreen = { x: scene.pointerX, y: scene.pointerY };
-      return;
-    }
-
-    if (this.tool === "select" && this.draggingId) {
+    if (this.draggingId) {
       const point = this.pickGroundPoint();
       if (!point) return;
+      const kind = this.draggingKind;
+      const id = this.draggingId;
 
       if (this.dragMode === "move") {
-        this.updateSelected({ x: point.x, z: point.z });
+        this.moveItem(id, kind, point);
       } else if (this.dragMode === "rotate") {
-        const center = this.itemCenter(this.draggingId, this.selectedKind);
+        const center = this.itemCenter(id, kind);
         if (center) {
           const angle = Math.atan2(point.x - center.x, point.z - center.z);
-          this.updateSelected({ rotation: angle });
+          this.setItemPatch(id, kind, { rotation: angle });
         }
       } else if (this.dragMode === "resize" && this.resizeStart) {
-        const center = this.itemCenter(this.draggingId, this.selectedKind);
+        const center = this.itemCenter(id, kind);
         if (center) {
           const distance = Math.hypot(point.x - center.x, point.z - center.z);
           const factor = distance / this.resizeStart.distance;
-          if (this.selectedKind === "decor" && this.resizeStart.decorScale !== undefined) {
-            const scale = clamp(this.resizeStart.decorScale * factor, MIN_SCALE, MAX_SCALE);
-            this.updateSelected({ scale });
-          } else if (
-            this.selectedKind === "barrier" &&
-            this.resizeStart.barrierWidth !== undefined &&
-            this.resizeStart.barrierDepth !== undefined
-          ) {
-            this.updateSelected({
+          if (kind === "decor" && this.resizeStart.decorScale !== undefined) {
+            this.setItemPatch(id, kind, { scale: clamp(this.resizeStart.decorScale * factor, MIN_SCALE, MAX_SCALE) });
+          } else if (kind === "barrier" && this.resizeStart.barrierWidth !== undefined && this.resizeStart.barrierDepth !== undefined) {
+            this.setItemPatch(id, kind, {
               width: Math.max(0.2, this.resizeStart.barrierWidth * factor),
               depth: Math.max(0.2, this.resizeStart.barrierDepth * factor),
             });
@@ -517,17 +475,10 @@ export class WorldEditor {
       this.drawPreview?.dispose();
       this.drawPreview = MeshBuilder.CreateGround(
         "barrier-preview",
-        {
-          width: Math.max(0.1, Math.abs(point.x - this.drawStart.x)),
-          height: Math.max(0.1, Math.abs(point.z - this.drawStart.z)),
-        },
+        { width: Math.max(0.1, Math.abs(point.x - this.drawStart.x)), height: Math.max(0.1, Math.abs(point.z - this.drawStart.z)) },
         this.gameScene.scene
       );
-      this.drawPreview.position.set(
-        (this.drawStart.x + point.x) / 2,
-        BARRIER_HEIGHT,
-        (this.drawStart.z + point.z) / 2
-      );
+      this.drawPreview.position.set((this.drawStart.x + point.x) / 2, BARRIER_HEIGHT, (this.drawStart.z + point.z) / 2);
       const material = new StandardMaterial("barrier-preview-mat", this.gameScene.scene);
       material.diffuseColor = new Color3(0.85, 0.2, 0.2);
       material.alpha = 0.4;
@@ -535,30 +486,23 @@ export class WorldEditor {
       return;
     }
 
-    if (this.tool === "select" && !this.draggingId) {
-      this.updateHover();
-    }
+    this.updateHover();
   }
 
   private handlePointerUp(): void {
-    if (this.panLastScreen) {
-      this.panLastScreen = null;
-      return;
-    }
-
-    if (this.tool === "select" && this.draggingId) {
+    if (this.draggingId) {
       if (this.draggedDuringGesture) {
         this.pushHistory();
-        // Refresh the selection panel/toolbar so displayed values reflect the change.
-        if (this.selectedKind === "decor") {
-          const item = this.decorItems.find((d) => d.id === this.selectedId) ?? null;
-          this.callbacks.onSelectionChange(item, "decor");
-        } else if (this.selectedKind === "barrier") {
-          const barrier = this.barriers.find((b) => b.id === this.selectedId) ?? null;
-          this.callbacks.onSelectionChange(barrier, "barrier");
+        if (this.inspectedId === this.draggingId) {
+          const item =
+            this.inspectedKind === "decor"
+              ? (this.decorItems.find((d) => d.id === this.inspectedId) ?? null)
+              : (this.barriers.find((b) => b.id === this.inspectedId) ?? null);
+          this.callbacks.onInspect(item, this.inspectedKind);
         }
       }
       this.draggingId = null;
+      this.draggingKind = null;
       this.draggedDuringGesture = false;
       this.dragMode = "move";
       this.resizeStart = null;
@@ -574,7 +518,6 @@ export class WorldEditor {
     if (point) {
       const width = Math.abs(point.x - this.drawStart.x);
       const depth = Math.abs(point.z - this.drawStart.z);
-
       if (width > 0.3 && depth > 0.3) {
         const barrier: Barrier = {
           id: crypto.randomUUID(),
@@ -594,15 +537,50 @@ export class WorldEditor {
     this.drawStart = null;
   }
 
-  private applyScreenPan(dxScreen: number, dyScreen: number): void {
-    const { camera } = this.gameScene;
-    const unitsPerPixelX = ((camera.orthoRight ?? 1) - (camera.orthoLeft ?? -1)) / this.engine.getRenderWidth();
-    const unitsPerPixelY = ((camera.orthoTop ?? 1) - (camera.orthoBottom ?? -1)) / this.engine.getRenderHeight();
+  private moveItem(id: string, kind: SelectionKind, point: { x: number; z: number }): void {
+    this.setItemPatch(id, kind, { x: point.x, z: point.z });
+  }
+
+  private setItemPatch(id: string, kind: SelectionKind, patch: Partial<DecorItem> | Partial<Barrier>): void {
+    if (kind === "decor") {
+      const item = this.decorItems.find((d) => d.id === id);
+      if (!item) return;
+      Object.assign(item, patch);
+      this.refreshDecorMesh(item);
+    } else if (kind === "barrier") {
+      const barrier = this.barriers.find((b) => b.id === id);
+      if (!barrier) return;
+      Object.assign(barrier, patch);
+      this.refreshBarrierMesh(barrier);
+    }
+  }
+
+  private applyContinuousPan(): void {
+    if (this.heldPanDirections.size === 0) return;
+    const dt = this.engine.getDeltaTime() / 1000;
+    const step = PAN_SPEED * dt;
     const { right, forward } = this.groundPanAxes();
-    const worldDelta = right
-      .scale(-dxScreen * unitsPerPixelX)
-      .add(forward.scale(-dyScreen * unitsPerPixelY));
-    camera.target.addInPlace(worldDelta);
+    let delta = Vector3.Zero();
+    if (this.heldPanDirections.has("up")) delta = delta.add(forward.scale(step));
+    if (this.heldPanDirections.has("down")) delta = delta.add(forward.scale(-step));
+    if (this.heldPanDirections.has("left")) delta = delta.add(right.scale(-step));
+    if (this.heldPanDirections.has("right")) delta = delta.add(right.scale(step));
+    this.gameScene.camera.target.addInPlace(delta);
+  }
+
+  /**
+   * The camera's right/"up on screen" directions, flattened onto the ground
+   * plane (Y zeroed out) so panning always slides across the flat map —
+   * like sliding a sheet of paper — instead of drifting off the fixed
+   * viewing angle the way the raw camera-space vectors would.
+   */
+  private groundPanAxes(): { right: Vector3; forward: Vector3 } {
+    const { camera } = this.gameScene;
+    const rawRight = camera.getDirection(Vector3.Right());
+    const rawUp = camera.getDirection(Vector3.Up());
+    const right = new Vector3(rawRight.x, 0, rawRight.z).normalize();
+    const forward = new Vector3(rawUp.x, 0, rawUp.z).normalize();
+    return { right, forward };
   }
 
   private addDecorMesh(item: DecorItem): void {
