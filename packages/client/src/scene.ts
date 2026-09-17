@@ -1,5 +1,6 @@
 import {
   ArcRotateCamera,
+  Camera,
   Color3,
   Engine,
   HemisphericLight,
@@ -11,14 +12,22 @@ import {
 } from "@babylonjs/core";
 
 /**
- * The camera angle is fixed for the whole game (Pony Town style): players
- * never rotate or tilt the view. ArcRotateCamera is used only because it's
- * the simplest way to point a camera at a target from a set angle/distance —
- * its orbit controls are intentionally never attached to the canvas.
+ * The camera angle is fixed for the whole game (Animal Jam Classic style):
+ * players never rotate or tilt the view. ArcRotateCamera is used only
+ * because it's the simplest way to point a camera at a target from a set
+ * angle/distance — its orbit controls are intentionally never attached to
+ * the canvas.
+ *
+ * The camera is orthographic, not perspective: a character standing "further
+ * back" on the map must render at the same size as one standing close, never
+ * shrinking with distance the way a real camera/photo would.
  */
 const FIXED_ALPHA = -Math.PI / 2;
 const FIXED_BETA = Math.PI / 3.6;
 const FIXED_RADIUS = 45;
+
+/** Half the height of the visible area, in world units — controls zoom level. */
+const ORTHO_SIZE = 12;
 
 const SKY_COLOR = new Color3(0.53, 0.72, 0.85);
 
@@ -48,6 +57,16 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScen
     scene
   );
   camera.inputs.clear();
+  camera.mode = Camera.ORTHOGRAPHIC_CAMERA;
+
+  const updateOrthoBounds = () => {
+    const aspect = engine.getRenderWidth() / engine.getRenderHeight();
+    camera.orthoTop = ORTHO_SIZE;
+    camera.orthoBottom = -ORTHO_SIZE;
+    camera.orthoLeft = -ORTHO_SIZE * aspect;
+    camera.orthoRight = ORTHO_SIZE * aspect;
+  };
+  updateOrthoBounds();
 
   const light = new HemisphericLight("mainLight", new Vector3(0, 1, 0), scene);
   light.intensity = 0.9;
@@ -57,6 +76,7 @@ export function createScene(engine: Engine, canvas: HTMLCanvasElement): GameScen
 
   window.addEventListener("resize", () => {
     engine.resize();
+    updateOrthoBounds();
   });
 
   return { scene, camera, ground };
